@@ -10,3 +10,8 @@ sudo curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/i
 ```
 sudo curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_bot_final.sh | sudo bash
 ```
+
+توکن را در قسمت مربوطه زیر جایگزاری کن
+```
+BOT_TOKEN="YOUR_BOT_TOKEN_HERE" PROXY_URL="" sudo bash -c 'curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_bot_final.sh | bash'
+```
