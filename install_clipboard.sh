@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V3 - Added Custom URL Key feature.
+# V4 - Final fixes: Expiry date formatting and Custom Key field implementation.
 
 set -e
 
@@ -25,14 +25,11 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V3 - Custom Key)"
+echo "📋 Internet Clipboard Server Installer (V4 - Finalizing Features)"
 echo "=================================================="
 
-
 # ============================================
-# 1. System Setup & Venv
-# (Skipped re-install, assuming VENV and packages are OK from previous run)
-# We re-run this to ensure consistency on a fresh server if needed.
+# 1. System Setup & Venv (Re-run for stability)
 # ============================================
 print_status "1/6: Installing essential tools and creating Virtual Environment..."
 apt update -y
@@ -40,13 +37,12 @@ apt install -y python3 python3-pip python3-venv curl wget
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
-python3 -m venv venv || true # Use || true to ignore error if directory already exists
+python3 -m venv venv || true 
 source venv/bin/activate || true
 
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# Install packages if not already installed
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
@@ -71,7 +67,7 @@ PORT=${PORT}
 ENVEOF
 
 # ============================================
-# 3. Create app.py (Modified to accept custom key)
+# 3. Create app.py (No functional change from V3, just ensuring consistency)
 # ============================================
 print_status "3/6: Creating app.py with custom key logic..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF'
@@ -94,7 +90,7 @@ UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 PORT = int(os.getenv('PORT', '3214')) 
-KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$' # Alphanumeric, hyphen, underscore, 3 to 64 chars
+KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 
 # --- Database Management ---
 def get_db():
@@ -127,7 +123,6 @@ def init_db():
 
 # --- Helper Functions ---
 def generate_key(length=8):
-    """Generates a random key if user doesn't provide one."""
     characters = string.ascii_letters + string.digits
     db = get_db()
     cursor = db.cursor()
@@ -182,7 +177,6 @@ def create_clip():
             return redirect(url_for('index'))
             
         key = custom_key
-        # Check if custom key already exists
         db = get_db()
         cursor = db.cursor()
         cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
@@ -190,7 +184,7 @@ def create_clip():
             flash(f'❌ خطا: نام **{key}** قبلاً استفاده شده است. لطفاً نام دیگری انتخاب کنید.', 'error')
             return redirect(url_for('index'))
     else:
-        key = generate_key() # Generate a random key
+        key = generate_key()
 
     file_path = None
     
@@ -224,7 +218,6 @@ def create_clip():
 
 @app.route('/<key>')
 def view_clip(key):
-    # (View logic remains the same)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -243,22 +236,27 @@ def view_clip(key):
         return render_template('clipboard.html', clip=None, key=key, expired=True)
 
     time_left = expires_at - now_utc
+    # Format expiry information here to ensure correct RTL display in template
     days = time_left.days
     hours = time_left.seconds // 3600
     minutes = (time_left.seconds % 3600) // 60
     
-    expiry_info = f"{days} days, {hours} hours, {minutes} minutes"
+    # The template will handle the two lines, we just pass the raw components
+    expiry_info_days = days
+    expiry_info_hours = hours
+    expiry_info_minutes = minutes
 
     return render_template('clipboard.html', 
                            key=key, 
                            content=content, 
                            file_path=file_path, 
-                           expiry_info=expiry_info)
+                           expiry_info_days=expiry_info_days,
+                           expiry_info_hours=expiry_info_hours,
+                           expiry_info_minutes=expiry_info_minutes)
 
 
 @app.route('/download/<key>')
 def download_file(key):
-    # (Download logic remains the same)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -295,23 +293,26 @@ if __name__ == '__main__':
 PYEOF
 
 # ============================================
-# 4. Create index.html (Modified to include custom key field)
+# 4. Create index.html (Includes Custom Key Input)
 # ============================================
 print_status "4/6: Creating index.html with Custom Key field..."
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard - کلیپ‌بورد اینترنتی</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data"><textarea name="content" rows="6" placeholder="متن مورد نظر شما"></textarea><p>یا</p><input type="file" name="file"><hr style="border: 1px dashed #ccc; margin: 15px 0;"><input type="text" name="custom_key" placeholder="لینک دلخواه (اختیاری، مثلا: MyProjectKey)" pattern="^[a-zA-Z0-9_-]{3,64}$" title="لینک دلخواه باید بین 3 تا 64 کاراکتر بوده و شامل حروف انگلیسی، اعداد، خط فاصله یا زیرخط باشد."><input type="submit" value="ایجاد لینک"><p style="font-size: 0.8em; color: #777;">اگر لینک دلخواه خالی باشد، یک لینک تصادفی ایجاد می‌شود.</p></form><p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p></div></body></html>
 HTM_INDEX
 
-# --- Create clipboard.html --- (No changes needed)
+# ============================================
+# 5. Create clipboard.html (Modified for two-line expiry)
+# ============================================
+print_status "5/6: Creating clipboard.html (Expiry fix)..."
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }</style></head><body><div class="container"><h2>کلیپ‌بورد: {{ key }}</h2>{% if clip is none %}<div class="flash-error">{% if expired %}❌ این لینک منقضی شده و محتوای آن پاک شده است.{% else %}❌ محتوایی با این آدرس یافت نشد.{% endif %}</div><p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>فایل ضمیمه:</h3><p>برای دانلود فایل زیر کلیک کنید:</p><p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p></div>{% endif %}{% if content %}<h3>محتوای متنی:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده: **{{ expiry_info }}**</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>{% endif %}</div></body></html>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }</style></head><body><div class="container"><h2>کلیپ‌بورد: {{ key }}</h2>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}{% if clip is none %}<div class="flash-error">{% if expired %}❌ این لینک منقضی شده و محتوای آن پاک شده است.{% else %}❌ محتوایی با این آدرس یافت نشد.{% endif %}</div><p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>فایل ضمیمه:</h3><p>برای دانلود فایل زیر کلیک کنید:</p><p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p></div>{% endif %}{% if content %}<h3>محتوای متنی:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده:<br>
+    **{{ expiry_info_days }}** روز، **{{ expiry_info_hours }}** ساعت، و **{{ expiry_info_minutes }}** دقیقه</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>{% endif %}</div></body></html>
 HTM_CLIPBOARD
 
-
 # ============================================
-# 5. DB Init & Systemd Service Setup
+# 6. Final Steps
 # ============================================
-print_status "5/6: Initializing Database and setting up Systemd service..."
+print_status "6/6: Initializing Database and starting service..."
 $PYTHON_VENV_PATH -c "from app import init_db; init_db()"
 
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -333,25 +334,15 @@ SERVICEEOF
 
 systemctl daemon-reload
 systemctl enable clipboard.service
-
-# ============================================
-# 6. Start Service and Final Instructions
-# ============================================
-print_status "6/6: Starting the Clipboard service on port $PORT..."
-systemctl start clipboard.service
-sleep 5
+systemctl restart clipboard.service # Restart the service to apply changes
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V3)"
+echo "🎉 Installation Complete (Clipboard Server V4)"
 echo "================================================"
 echo "✅ Service Status: $(systemctl is-active clipboard.service)"
 echo "🌐 Your Clipboard Server is running on port $PORT."
-echo "🔗 Access URL (Replace IP with your server's public IP):"
-echo "   http://YOUR_SERVER_IP:$PORT/"
 echo "------------------------------------------------"
-echo "To check the service status or logs:"
 echo "Status:   sudo systemctl status clipboard.service"
-echo "Restart:  sudo systemctl restart clipboard.service"
 echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
