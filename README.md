@@ -15,3 +15,10 @@ sudo curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/i
 ```
 BOT_TOKEN="YOUR_BOT_TOKEN_HERE" PROXY_URL="" sudo bash -c 'curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_bot_final.sh | bash'
 ```
+
+
+```
+BOT_TOKEN="YOUR_BOT_TOKEN" PROXY_URL="" sudo bash -c 'curl -sL https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_clipboard.sh | bash'
+```
+
+
