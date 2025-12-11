@@ -1,7 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# Installs a simple web service similar to cl1p.net on port 3214.
-# V2 - Non-interactive and no external variables needed.
+# V3 - Added Custom URL Key feature.
 
 set -e
 
@@ -26,46 +25,40 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (Port: $PORT)"
+echo "📋 Internet Clipboard Server Installer (V3 - Custom Key)"
 echo "=================================================="
 
 
 # ============================================
-# 1. System Update & Essential Tools
+# 1. System Setup & Venv
+# (Skipped re-install, assuming VENV and packages are OK from previous run)
+# We re-run this to ensure consistency on a fresh server if needed.
 # ============================================
-print_status "1/6: Updating system and installing essential tools (Python3, PIP, venv)..."
+print_status "1/6: Installing essential tools and creating Virtual Environment..."
 apt update -y
-# We include curl and wget just in case, though they are often pre-installed
 apt install -y python3 python3-pip python3-venv curl wget
 
-# Create Virtual Environment and activate it
-print_status "1/6: Creating Virtual Environment..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv || true # Use || true to ignore error if directory already exists
+source venv/bin/activate || true
 
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# ============================================
-# 2. Install Python Packages
-# ============================================
-print_status "2/6: Installing Python packages (Flask, Gunicorn, dotenv)..."
-
+# Install packages if not already installed
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
 gunicorn
 REQEOF
-
-pip install -r requirements.txt
+pip install -r requirements.txt || true
 deactivate
 
 # ============================================
-# 3. Create Project Structure and Files
+# 2. Update .env and Directories
 # ============================================
-print_status "3/6: Creating project directory structure and files..."
+print_status "2/6: Updating configuration and directory structure..."
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
 chmod 777 "$INSTALL_DIR/uploads" 
@@ -77,12 +70,16 @@ EXPIRY_DAYS=${EXPIRY_DAYS}
 PORT=${PORT}
 ENVEOF
 
-# --- Create app.py --- (CODE START)
+# ============================================
+# 3. Create app.py (Modified to accept custom key)
+# ============================================
+print_status "3/6: Creating app.py with custom key logic..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF'
 import os
 import sqlite3
 import random
 import string
+import re
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv
@@ -97,6 +94,7 @@ UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 PORT = int(os.getenv('PORT', '3214')) 
+KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$' # Alphanumeric, hyphen, underscore, 3 to 64 chars
 
 # --- Database Management ---
 def get_db():
@@ -129,6 +127,7 @@ def init_db():
 
 # --- Helper Functions ---
 def generate_key(length=8):
+    """Generates a random key if user doesn't provide one."""
     characters = string.ascii_letters + string.digits
     db = get_db()
     cursor = db.cursor()
@@ -142,7 +141,6 @@ def generate_key(length=8):
 def cleanup_expired_clips():
     db = get_db()
     cursor = db.cursor()
-    
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
@@ -159,7 +157,6 @@ def cleanup_expired_clips():
             
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
     db.commit()
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cleanup completed.")
 
 # --- Routes ---
 
@@ -172,21 +169,40 @@ def index():
 def create_clip():
     content = request.form.get('content')
     uploaded_file = request.files.get('file')
+    custom_key = request.form.get('custom_key', '').strip()
 
     if not content and (not uploaded_file or not uploaded_file.filename):
-        flash('You must provide text or a file.', 'error')
+        flash('شما باید متن یا فایل ارائه دهید.', 'error')
         return redirect(url_for('index'))
 
-    key = generate_key()
+    # 1. Key determination and validation
+    if custom_key:
+        if not re.match(KEY_REGEX, custom_key):
+            flash('لینک دلخواه باید فقط شامل حروف انگلیسی، اعداد، خط فاصله (-) یا زیرخط (_) باشد و طول آن بین 3 تا 64 کاراکتر باشد.', 'error')
+            return redirect(url_for('index'))
+            
+        key = custom_key
+        # Check if custom key already exists
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
+        if cursor.fetchone():
+            flash(f'❌ خطا: نام **{key}** قبلاً استفاده شده است. لطفاً نام دیگری انتخاب کنید.', 'error')
+            return redirect(url_for('index'))
+    else:
+        key = generate_key() # Generate a random key
+
     file_path = None
     
+    # 2. Handle file upload
     if uploaded_file and uploaded_file.filename:
         filename = uploaded_file.filename
         file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{filename}")
         file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
         uploaded_file.save(file_path_absolute)
-        file_path = file_path_relative # Store relative path in DB
+        file_path = file_path_relative
         
+    # 3. Save to database
     expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
 
     try:
@@ -197,17 +213,18 @@ def create_clip():
             (key, content, file_path, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
         )
         db.commit()
-        flash(f'Clipboard created successfully! Share this link: {url_for("view_clip", key=key, _external=True)}', 'success')
+        flash(f'✅ کلیپ‌بورد با موفقیت ایجاد شد! لینک: {url_for("view_clip", key=key, _external=True)}', 'success')
         return redirect(url_for('view_clip', key=key))
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
-        flash('An internal error occurred during creation.', 'error')
+        flash('❌ یک خطای داخلی هنگام ذخیره رخ داد.', 'error')
         return redirect(url_for('index'))
 
 
 @app.route('/<key>')
 def view_clip(key):
+    # (View logic remains the same)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -241,13 +258,14 @@ def view_clip(key):
 
 @app.route('/download/<key>')
 def download_file(key):
+    # (Download logic remains the same)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
     clip = cursor.fetchone()
 
     if not clip:
-        flash('File not found or link expired.', 'error')
+        flash('فایل یافت نشد یا لینک منقضی شده است.', 'error')
         return redirect(url_for('index'))
 
     file_path_relative, expires_at_str = clip
@@ -255,7 +273,7 @@ def download_file(key):
     expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
     if expires_at < datetime.now(timezone.utc):
         cleanup_expired_clips()
-        flash('File not found or link expired.', 'error')
+        flash('فایل یافت نشد یا لینک منقضی شده است.', 'error')
         return redirect(url_for('index'))
     
     if file_path_relative:
@@ -267,7 +285,7 @@ def download_file(key):
                                    as_attachment=True, 
                                    download_name=original_filename)
     
-    flash('No file associated with this link.', 'error')
+    flash('فایلی برای این لینک وجود ندارد.', 'error')
     return redirect(url_for('view_clip', key=key))
 
 
@@ -275,34 +293,26 @@ if __name__ == '__main__':
     init_db()
     app.run(host='0.0.0.0', port=PORT, debug=True)
 PYEOF
-# --- Create app.py --- (CODE END)
 
-
-# --- Create index.html --- (CONTENT START)
+# ============================================
+# 4. Create index.html (Modified to include custom key field)
+# ============================================
+print_status "4/6: Creating index.html with Custom Key field..."
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard - کلیپ‌بورد اینترنتی</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data"><textarea name="content" rows="6" placeholder="متن مورد نظر شما"></textarea><p>یا</p><input type="file" name="file"><input type="submit" value="ایجاد لینک"></form><p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p></div></body></html>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard - کلیپ‌بورد اینترنتی</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data"><textarea name="content" rows="6" placeholder="متن مورد نظر شما"></textarea><p>یا</p><input type="file" name="file"><hr style="border: 1px dashed #ccc; margin: 15px 0;"><input type="text" name="custom_key" placeholder="لینک دلخواه (اختیاری، مثلا: MyProjectKey)" pattern="^[a-zA-Z0-9_-]{3,64}$" title="لینک دلخواه باید بین 3 تا 64 کاراکتر بوده و شامل حروف انگلیسی، اعداد، خط فاصله یا زیرخط باشد."><input type="submit" value="ایجاد لینک"><p style="font-size: 0.8em; color: #777;">اگر لینک دلخواه خالی باشد، یک لینک تصادفی ایجاد می‌شود.</p></form><p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p></div></body></html>
 HTM_INDEX
-# --- Create index.html --- (CONTENT END)
 
-
-# --- Create clipboard.html --- (CONTENT START)
+# --- Create clipboard.html --- (No changes needed)
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }</style></head><body><div class="container"><h2>کلیپ‌بورد: {{ key }}</h2>{% if clip is none %}<div class="flash-error">{% if expired %}❌ این لینک منقضی شده و محتوای آن پاک شده است.{% else %}❌ محتوایی با این آدرس یافت نشد.{% endif %}</div><p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>فایل ضمیمه:</h3><p>برای دانلود فایل زیر کلیک کنید:</p><p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p></div>{% endif %}{% if content %}<h3>محتوای متنی:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده: **{{ expiry_info }}**</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>{% endif %}</div></body></html>
 HTM_CLIPBOARD
-# --- Create clipboard.html --- (CONTENT END)
 
 
 # ============================================
-# 4. Initialize Database
+# 5. DB Init & Systemd Service Setup
 # ============================================
-print_status "4/6: Initializing SQLite database..."
-# Run init_db using the VENV python to ensure dependencies are loaded
+print_status "5/6: Initializing Database and setting up Systemd service..."
 $PYTHON_VENV_PATH -c "from app import init_db; init_db()"
-
-# ============================================
-# 5. Create Systemd Service
-# ============================================
-print_status "5/6: Creating systemd service for persistent running..."
 
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
@@ -313,7 +323,6 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# Gunicorn command: 4 workers, binding to all interfaces on the specified port
 ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${PORT} app:app
 Restart=always
 TimeoutSec=30
@@ -334,7 +343,7 @@ sleep 5
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V2)"
+echo "🎉 Installation Complete (Clipboard Server V3)"
 echo "================================================"
 echo "✅ Service Status: $(systemctl is-active clipboard.service)"
 echo "🌐 Your Clipboard Server is running on port $PORT."
@@ -343,5 +352,6 @@ echo "   http://YOUR_SERVER_IP:$PORT/"
 echo "------------------------------------------------"
 echo "To check the service status or logs:"
 echo "Status:   sudo systemctl status clipboard.service"
+echo "Restart:  sudo systemctl restart clipboard.service"
 echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
