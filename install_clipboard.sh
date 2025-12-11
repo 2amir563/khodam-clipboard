@@ -1,15 +1,13 @@
 #!/bin/bash
-# Internet Clipboard Service Installer (Gunicorn + Flask + SQLite)
+# Telegram Media Downloader Bot - Complete Unified Installer (V31 - FINAL)
+# Optimized for non-interactive execution (curl | bash) using environment variables.
 
 set -e
 
 # --- Configuration ---
-INSTALL_DIR="/opt/clipboard_server"
-PYTHON_BIN=$(which python3)
-GUNICORN_BIN=$(which gunicorn)
-PORT="3214"
-EXPIRY_DAYS="30"
-SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) # Generates a strong secret key
+INSTALL_DIR="/opt/telegram-media-bot"
+EXPIRY_DAYS="2"
+MAX_FILE_SIZE="2000" 
 
 # Colors
 GREEN='\033[0;32m'
@@ -19,433 +17,419 @@ NC='\033[0m'
 print_status() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 
+# --- Check Environment Variables (Token is mandatory) ---
+if [ -z "$BOT_TOKEN" ]; then
+    print_error "❌ ERROR: The BOT_TOKEN environment variable is not set."
+    print_error "💡 Please run the installation command exactly as instructed, providing the token and proxy."
+    exit 1
+fi
+
+PROXY_URL=${PROXY_URL:-""} # Default PROXY_URL to empty string if not provided
+
 # Check root access
 if [ "$EUID" -ne 0 ]; then
-    print_error "Please run with root access: sudo bash install_clipboard.sh"
+    print_error "❌ Please run with root access: sudo bash install_bot_final.sh"
     exit 1
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (Port: $PORT)"
+echo "🤖 Telegram Downloader Bot Installer (V31)"
 echo "=================================================="
+echo "🔑 Using Bot Token: [Token Set]"
+echo "🌐 Proxy URL: [${PROXY_URL:+Set} ${PROXY_URL:-Not Set}]"
+
 
 # ============================================
 # 1. System Update & Essential Tools
 # ============================================
-print_status "1/6: Updating system and installing essential tools (Python3, PIP, Gunicorn)..."
+print_status "1/7: Updating system and installing essential tools (Python3, PIP, FFmpeg)..."
 apt update -y
-apt install -y python3 python3-pip python3-venv curl wget
+apt install -y python3 python3-pip ffmpeg curl wget git build-essential
 
-# Create Virtual Environment and activate it
-print_status "1/6: Creating Virtual Environment..."
+# Remove old/system packages to prevent conflicts
+apt remove -y youtube-dl yt-dlp 2>/dev/null || true
+
+# ============================================
+# 2. Create Project Structure and Venv
+# ============================================
+print_status "2/7: Creating project directory structure and Virtual Environment..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
+
+mkdir -p downloads logs cookies tmp
+chmod -R 777 downloads logs cookies tmp
+
 python3 -m venv venv
 source venv/bin/activate
 
+PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
+
 # ============================================
-# 2. Install Python Packages
+# 3. Install Python Packages
 # ============================================
-print_status "2/6: Installing Python packages (Flask, Gunicorn, dotenv)..."
+print_status "3/7: Installing Python packages (yt-dlp, python-telegram-bot, dotenv)..."
 
 cat > requirements.txt << 'REQEOF'
-Flask
-python-dotenv
-gunicorn
+python-telegram-bot>=20.7
+python-dotenv>=1.0.0
+yt-dlp>=2024.4.9
+aiofiles>=23.2.1
+requests>=2.31.0
+psutil>=5.9.8
 REQEOF
 
+pip install --upgrade pip
 pip install -r requirements.txt
 
-# Deactivate the venv for now
 deactivate
-PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
-GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
 # ============================================
-# 3. Create Project Structure and Files
+# 4. Create Configuration (.env)
 # ============================================
-print_status "3/6: Creating project directory structure and files..."
-mkdir -p "$INSTALL_DIR/templates"
-mkdir -p "$INSTALL_DIR/uploads"
-chmod 777 "$INSTALL_DIR/uploads" # Ensure Gunicorn user can write files
+print_status "4/7: Creating configuration file (.env)..."
 
-# --- Create .env file ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
-SECRET_KEY=${SECRET_KEY}
-EXPIRY_DAYS=${EXPIRY_DAYS}
+BOT_TOKEN=${BOT_TOKEN}
+MAX_FILE_SIZE=${MAX_FILE_SIZE}
+DELETE_AFTER_MINUTES=${EXPIRY_DAYS}
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+PROXY_URL="${PROXY_URL}"
 ENVEOF
 
-# --- Create app.py ---
-cat > "$INSTALL_DIR/app.py" << 'PYEOF'
+# ============================================
+# 5. Create Bot File (bot.py - V31)
+# ============================================
+print_status "5/7: Creating main bot file (bot.py - V31 - English Code)..."
+
+cat > "$INSTALL_DIR/bot.py" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Telegram Media Downloader Bot - V31 (Production Ready - Environment Variables Safe)
+"""
+
 import os
-import sqlite3
-import random
-import string
-from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
+import sys
+import logging
+import subprocess
+import asyncio
+import re
+import json
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, unquote
+
+from telegram import Update
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes
+)
+from telegram.constants import ParseMode
 from dotenv import load_dotenv
 
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DELETE_AFTER = int(os.getenv("DELETE_AFTER_MINUTES", "2"))
+MAX_SIZE_MB = int(os.getenv("MAX_FILE_SIZE", "2000"))
+USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+PROXY_URL = os.getenv("PROXY_URL", "")
 
-# --- Configuration ---
-app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'your_strong_secret_key') 
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN is missing in .env file.")
+    sys.exit(1)
 
-# --- Database Management ---
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE_PATH)
-    return db
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+def clean_url(text):
+    if not text: return None
+    text = text.strip()
+    url_pattern = r'(https?://[^\s<>"\']+|www\.[^\s<>"\']+\.[a-z]{2,})'
+    matches = re.findall(url_pattern, text, re.IGNORECASE)
+    if matches:
+        url = matches[0]
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        url = re.sub(r'[.,;:!?]+$', '', url)
+        return unquote(url)
+    return None
 
-def init_db():
-    """Initializes the SQLite database structure."""
-    with app.app_context():
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS clips (
-                id INTEGER PRIMARY KEY,
-                key TEXT UNIQUE NOT NULL,
-                content TEXT,
-                file_path TEXT,
-                created_at DATETIME NOT NULL,
-                expires_at DATETIME NOT NULL
-            )
-        """)
-        db.commit()
-
-# --- Helper Functions ---
-def generate_key(length=8):
-    """Generates a unique random alphanumeric key."""
-    characters = string.ascii_letters + string.digits
-    db = get_db()
-    cursor = db.cursor()
-    while True:
-        key = ''.join(random.choice(characters) for i in range(length))
-        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
-        exists = cursor.fetchone()
-        if not exists:
-            return key
-
-def cleanup_expired_clips():
-    """Deletes expired clips and their associated files."""
-    db = get_db()
-    cursor = db.cursor()
-    
-    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-    # Find expired entries
-    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
-    expired_files = cursor.fetchall()
-
-    # Delete files
-    for file_path_tuple in expired_files:
-        file_path = file_path_tuple[0]
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError as e:
-                print(f"Error removing file {file_path}: {e}")
-            
-    # Delete database entries
-    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
-    db.commit()
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cleanup completed. Removed {len(expired_files)} expired entries/files.")
-
-
-# --- Routes ---
-
-@app.route('/')
-def index():
-    """Main page to create a new clipboard."""
-    # Ensure cleanup runs occasionally (e.g., on index load)
-    cleanup_expired_clips()
-    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
-
-@app.route('/create', methods=['POST'])
-def create_clip():
-    """Handles the creation of the new clip from form submission."""
-    content = request.form.get('content')
-    uploaded_file = request.files.get('file')
-
-    if not content and (not uploaded_file or not uploaded_file.filename):
-        flash('You must provide text or a file.', 'error')
-        return redirect(url_for('index'))
-
-    key = generate_key()
-    file_path = None
-    
-    # Handle file upload
-    if uploaded_file and uploaded_file.filename:
-        filename = uploaded_file.filename
-        file_path = os.path.join(UPLOAD_FOLDER, f"{key}_{filename}")
-        # Securely save the file
-        uploaded_file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path))
-        
-    # Calculate expiry date (UTC)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
-
+def format_size(bytes_val):
+    if bytes_val is None: return "Unknown"
     try:
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (key, content, file_path, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+        bytes_val = float(bytes_val)
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:.1f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f} TB"
+    except:
+        return "Unknown"
+
+def build_common_cmd(url, output_path=None, dump_json=False):
+    """Builds the common yt-dlp command list, applying proxy and cookies."""
+    # Ensure yt-dlp is called correctly from the virtual environment
+    # Note: When run via Systemd, the VENV paths are handled by ExecStart
+    # However, this explicit path is safer in some environments.
+    python_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv/bin/python3")
+    
+    cmd = [
+        python_path, 
+        "-m", "yt_dlp",
+        "--user-agent", USER_AGENT,
+        "--no-warnings",
+        "--ignore-errors",
+        "--no-playlist",
+        "--force-ipv4",
+        "--add-header", "Accept-Language: en-US,en;q=0.5",
+        url
+    ]
+    
+    if dump_json:
+        cmd.extend(["--dump-json", "--skip-download"])
+    elif output_path:
+        cmd.extend([
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]/best",
+            "-o", output_path,
+            "--concurrent-fragments", "4",
+            "--limit-rate", "10M",
+            "--retries", "10",               
+            "--fragment-retries", "10",      
+            "--no-check-certificate", 
+            "--referer", "https://google.com/",
+            "--http-chunk-size", "10M",
+            "--force-overwrite"
+        ])
+
+    if PROXY_URL:
+        cmd.extend(["--proxy", PROXY_URL])
+        
+    cookies_file = Path(os.path.dirname(os.path.abspath(__file__))) / "cookies" / "cookies.txt"
+    if cookies_file.exists():
+        cmd.extend(["--cookies", str(cookies_file)])
+        
+    return cmd
+
+async def get_video_info(url):
+    cmd = build_common_cmd(url, dump_json=True)
+        
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        db.commit()
-        flash(f'Clipboard created successfully! Share this link: {url_for("view_clip", key=key, _external=True)}', 'success')
-        return redirect(url_for('view_clip', key=key))
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30) 
         
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        flash('An internal error occurred during creation.', 'error')
-        return redirect(url_for('index'))
-
-
-@app.route('/<key>')
-def view_clip(key):
-    """Displays the content of the clipboard or file link."""
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
-    clip = cursor.fetchone()
-
-    if not clip:
-        return render_template('clipboard.html', clip=None, key=key)
-
-    content, file_path, expires_at_str = clip
-    
-    # Check expiry
-    expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-    now_utc = datetime.now(timezone.utc)
-    
-    if expires_at < now_utc:
-        # If expired, run immediate cleanup and show expired message
-        cleanup_expired_clips()
-        return render_template('clipboard.html', clip=None, key=key, expired=True)
-
-    # Format remaining time
-    time_left = expires_at - now_utc
-    days = time_left.days
-    hours = time_left.seconds // 3600
-    minutes = (time_left.seconds % 3600) // 60
-    
-    expiry_info = f"{days} days, {hours} hours, {minutes} minutes"
-
-    return render_template('clipboard.html', 
-                           key=key, 
-                           content=content, 
-                           file_path=file_path, 
-                           expiry_info=expiry_info)
-
-
-@app.route('/download/<key>')
-def download_file(key):
-    """Handles file download."""
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
-    clip = cursor.fetchone()
-
-    if not clip:
-        flash('File not found or link expired.', 'error')
-        return redirect(url_for('index'))
-
-    file_full_path, expires_at_str = clip
-    
-    # Check expiry
-    expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
-        cleanup_expired_clips()
-        flash('File not found or link expired.', 'error')
-        return redirect(url_for('index'))
-    
-    if file_full_path:
-        # Extract filename from path (e.g., uploads/key_filename.ext -> filename.ext)
-        filename_with_key = os.path.basename(file_full_path)
-        # Original filename is needed for download prompt (after the key_)
-        original_filename = filename_with_key.split('_', 1)[1] if '_' in filename_with_key else filename_with_key
+        if process.returncode == 0:
+            try:
+                info = json.loads(stdout.decode('utf-8').strip().split('\n')[-1])
+                return info.get('title', 'N/A')
+            except json.JSONDecodeError:
+                logger.error("Failed to decode JSON from yt-dlp info.")
+                return "N/A"
+        else:
+            error_output = stderr.decode('utf-8', errors='ignore').strip().splitlines()[0] if stderr else "Unknown Error"
+            logger.warning(f"Info fetch failed (Code {process.returncode}): {error_output}")
+            
+            if "logged-in" in error_output or "HTTP Error 404" in error_output:
+                return "N/A (Access/Login Required)"
+            
+            return f"N/A (Error: {error_output.replace('ERROR: ', '')})"
         
-        # Send the file from the UPLOAD_FOLDER
-        return send_from_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_FOLDER), 
-                                   filename_with_key, 
-                                   as_attachment=True, 
-                                   download_name=original_filename)
+    except Exception as e:
+        logger.error(f"Error fetching video info: {e}")
+        return "N/A (Internal Error)"
+
+async def download_video(url, output_path):
+    cmd = build_common_cmd(url, output_path=output_path)
     
-    flash('No file associated with this link.', 'error')
-    return redirect(url_for('view_clip', key=key))
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=480) 
+        
+        if process.returncode == 0:
+            return True, "Success"
+        else:
+            error_output = stderr.decode('utf-8', errors='ignore')
+            raw_error_line = error_output.strip().splitlines()[0] if error_output.strip() else "Unknown/Empty Error"
+
+            if "HTTP Error 404" in error_output or "Private video" in error_output or "logged-in" in error_output:
+                return False, f"Download failed. Access/Login Required. Please use cookies."
+            
+            if "HTTP Error 412" in error_output or "HTTP Error 403" in error_output:
+                 return False, f"Download failed. Potential Geo-Block or Security Error. Try a proxy or cookies."
+
+            logger.error(f"yt-dlp error output (Code {process.returncode}): {error_output[:500]}...")
+            return False, f"Download failed: Check URL, Access, or Geo-Block. (Code: {process.returncode}). Raw Error: {raw_error_line}"
+            
+    except asyncio.TimeoutError:
+        return False, "Download Timeout (8 minutes)."
+    except Exception as e:
+        return False, f"Internal Error: {str(e)}"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome = f"""
+🤖 *UNIVERSAL Media Downloader Bot - V31*
+
+📝 *How to Use:*
+1. Send any media URL (Pinterest, Vimeo, Bilibili, etc.).
+2. The bot will download and send the file with the video title in the caption.
+
+⚠️ If you encounter 'Access/Login Required' errors, you must provide a valid `cookies.txt` file in the bot's installation directory.
+"""
+    await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    original_url = update.message.text
+    url = clean_url(original_url)
+    
+    if not url:
+        await update.message.reply_text("❌ *Invalid URL*", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    msg = await update.message.reply_text(f"🔗 *Processing URL...*\n\nFetching video details...", parse_mode=ParseMode.MARKDOWN)
+    video_title = await get_video_info(url)
+    
+    try:
+        parsed = urlparse(url)
+        site = parsed.netloc.split('.')[-2] if parsed.netloc.count('.') >= 2 else parsed.netloc.split('.')[0]
+        site = site.replace('www.', '').split(':')[0].upper()
+    except:
+        site = "UNKNOWN"
+        
+    await msg.edit_text(f"📥 *Downloading...* (Title: {video_title[:50]}...)", parse_mode=ParseMode.MARKDOWN)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{site}_{timestamp}"
+    output_template = f"downloads/{filename}.%(ext)s"
+    
+    success, result = await download_video(url, output_template)
+    
+    if not success:
+        await msg.edit_text(f"❌ *Download Failed*\n\nError: `{result}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    download_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "downloads"
+    downloaded_files = list(download_dir.glob(f"{filename}.*"))
+    downloaded_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    
+    if not downloaded_files:
+        await msg.edit_text("❌ Download complete, but final file not found.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    file_path = downloaded_files[0]
+    file_size = file_path.stat().st_size
+    
+    if file_size > (MAX_SIZE_MB * 1024 * 1024):
+        file_path.unlink() 
+        await msg.edit_text(f"❌ *File size exceeds limit:* {format_size(file_size)}", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    await msg.edit_text(f"📤 *Uploading...*\n\nSize: {format_size(file_size)}", parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        with open(file_path, 'rb') as file:
+            file_ext = file_path.suffix.lower()
+            
+            caption_text = (
+                f"**{video_title}**\n\n"
+                f"✅ Download Complete!\n"
+                f"Size: {format_size(file_size)}\n"
+                f"Original URL: [Link]({url})"
+            )
+            
+            if file_ext in ['.mp3', '.m4a', '.wav']:
+                await update.message.reply_audio(audio=file, caption=caption_text, parse_mode=ParseMode.MARKDOWN)
+            else: 
+                await update.message.reply_video(
+                    video=file, 
+                    caption=caption_text, 
+                    parse_mode=ParseMode.MARKDOWN,
+                    supports_streaming=True
+                )
+        
+        await msg.edit_text("🎉 *Success!*", parse_mode=ParseMode.MARKDOWN)
+        
+        async def delete_file_task():
+            await asyncio.sleep(DELETE_AFTER * 60)
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+        asyncio.create_task(delete_file_task())
+        
+    except Exception as upload_error:
+        await msg.edit_text(f"❌ *Upload Failed*\n\nError: {str(upload_error)[:100]}", parse_mode=ParseMode.MARKDOWN)
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    
+    try:
+        print("✅ Bot started polling...")
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        print(f"Bot failed to start polling: {e}")
+        sys.exit(1)
 
 
-if __name__ == '__main__':
-    # Initialize DB outside of Gunicorn start for first run
-    init_db()
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+if __name__ == "__main__":
+    main()
 PYEOF
 
-# --- Create index.html ---
-cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Internet Clipboard - کلیپ‌بورد اینترنتی</title>
-    <style>
-        body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }
-        .container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }
-        textarea, input[type="file"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }
-        input[type="submit"]:hover { background-color: #0056b3; }
-        .flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }
-        .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Clipboard Server</h2>
-        <p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                <ul style="list-style: none; padding: 0;">
-                    {% for category, message in messages %}
-                        <li class="flash-{{ category }}">{{ message | safe }}</li>
-                    {% endfor %}
-                </ul>
-            {% endif %}
-        {% endwith %}
-
-        <form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data">
-            <textarea name="content" rows="6" placeholder="متن مورد نظر شما"></textarea>
-            <p>یا</p>
-            <input type="file" name="file">
-            <input type="submit" value="ایجاد لینک">
-        </form>
-        <p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p>
-    </div>
-</body>
-</html>
-HTM_INDEX
-
-# --- Create clipboard.html ---
-cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clipboard - {{ key }}</title>
-    <style>
-        body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }
-        .container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }
-        .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }
-        a { color: #007bff; text-decoration: none; font-weight: bold; }
-        a:hover { text-decoration: underline; }
-        .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }
-        .file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>کلیپ‌بورد: {{ key }}</h2>
-        
-        {% if clip is none %}
-            <div class="flash-error">
-                {% if expired %}
-                    ❌ این لینک منقضی شده و محتوای آن پاک شده است.
-                {% else %}
-                    ❌ محتوایی با این آدرس یافت نشد.
-                {% endif %}
-            </div>
-            <p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>
-        {% else %}
-            {% if file_path %}
-                <div class="file-info">
-                    <h3>فایل ضمیمه:</h3>
-                    <p>برای دانلود فایل زیر کلیک کنید:</p>
-                    <p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p>
-                </div>
-            {% endif %}
-
-            {% if content %}
-                <h3>محتوای متنی:</h3>
-                <div class="content-box">{{ content }}</div>
-            {% endif %}
-            
-            <p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده: **{{ expiry_info }}**</p>
-            <p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>
-        {% endif %}
-    </div>
-</body>
-</html>
-HTM_CLIPBOARD
-
-# --- Initialize DB ---
-print_status "4/6: Initializing SQLite database..."
-$PYTHON_VENV_PATH -c "from app import init_db; init_db()"
+chmod +x "$INSTALL_DIR/bot.py"
 
 # ============================================
-# 5. Create Systemd Service
+# 6. Create Systemd Service
 # ============================================
-print_status "5/6: Creating systemd service for persistent running..."
+print_status "6/7: Creating systemd service for persistent running..."
 
-cat > /etc/systemd/system/clipboard.service << SERVICEEOF
+cat > /etc/systemd/system/telegram-media-bot.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Service
+Description=Telegram Media Downloader Bot
 After=network.target
 
 [Service]
 Type=simple
-# Using root is fine for this utility script, but typically a dedicated user is recommended
-User=root 
-WorkingDirectory=${INSTALL_DIR}
-# Gunicorn command: 4 workers, binding to all interfaces on the specified port
-ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${PORT} app:app
 Restart=always
-TimeoutSec=30
+RestartSec=10
+User=root
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${PYTHON_VENV_PATH} ${INSTALL_DIR}/bot.py
+StandardOutput=append:/opt/telegram-media-bot/logs/bot.log
+StandardError=append:/opt/telegram-media-bot/logs/bot-error.log
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
-systemctl enable clipboard.service
+systemctl enable telegram-media-bot.service
 
 # ============================================
-# 6. Start Service
+# 7. Start Service and Final Instructions
 # ============================================
-print_status "6/6: Starting the Clipboard service on port $PORT..."
-systemctl start clipboard.service
+print_status "7/7: Starting the bot service..."
+systemctl start telegram-media-bot.service
 sleep 5
 
-# ============================================
-# FINAL INSTRUCTIONS
-# ============================================
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server)"
+echo "🎉 Installation Complete (Telegram Bot V31)"
 echo "================================================"
-echo "✅ Service Status: $(systemctl is-active clipboard.service)"
-echo "🌐 Your Clipboard Server is running on port $PORT."
-echo "🔗 Access URL (Replace IP with your server's public IP):"
-echo "   http://YOUR_SERVER_IP:$PORT/"
-echo ""
-echo "⚙️ Management Commands:"
+echo "✅ Service Status: $(systemctl is-active telegram-media-bot.service)"
+echo "⚠️ CRITICAL: To handle Access/Login errors, place your 'cookies.txt' file here:"
+echo "   /opt/telegram-media-bot/cookies/cookies.txt"
+echo "🌐 Proxy URL (if set) is configured in /opt/telegram-media-bot/.env"
 echo "------------------------------------------------"
-echo "Status:   systemctl status clipboard.service"
-echo "Restart:  systemctl restart clipboard.service"
-echo "Logs:     journalctl -u clipboard.service -f"
-echo "------------------------------------------------"
-echo "⚠️ Expiry: All files/texts are set to expire and be deleted after $EXPIRY_DAYS days."
+echo "To check the service status or logs:"
+echo "Status:   sudo systemctl status telegram-media-bot.service"
+echo "Logs:     sudo journalctl -u telegram-media-bot.service -f"
 echo "================================================"
