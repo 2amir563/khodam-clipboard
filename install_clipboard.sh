@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V34 - FINAL STABILITY & OPTIMIZATION: SQLite fix (no WAL) + Gunicorn Workers set to 2.
+# V35 - FINAL STABILITY & OPTIMIZATION: SQLite fix (no WAL) + Gunicorn Workers set to 2 + HTML template fix for file-only clips.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V34 - Final Stable & Optimized)"
+echo "📋 Internet Clipboard Server Installer (V35 - Final Stable & Optimized)"
 echo "=================================================="
 
 # ============================================
@@ -89,7 +89,7 @@ ENVEOF
 # ============================================
 # 3. Create web_service.py (V33 Logic - Explicit Isolation, Unix Time)
 # ============================================
-print_status "3/7: Creating web_service.py (V34 - SQLite stability confirmed)..."
+print_status "3/7: Creating web_service.py (V35 - SQLite stability confirmed)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -282,7 +282,9 @@ def view_clip(key):
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
 
-    content, file_path_string, expires_at_ts = clip
+    content = clip['content']
+    file_path_string = clip['file_path']
+    expires_at_ts = clip['expires_at']
     
     now_ts = int(time.time())
     
@@ -319,7 +321,8 @@ def view_clip(key):
                            expiry_info_days=days,
                            expiry_info_hours=hours,
                            expiry_info_minutes=minutes,
-                           server_port=CLIPBOARD_PORT)
+                           server_port=CLIPBOARD_PORT,
+                           clip=clip)
 
 
 @app.route('/download/<path:file_path>')
@@ -371,9 +374,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V33)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V35)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V34)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V35)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -704,11 +707,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (NO CHANGE)
+# 5. Create Minimal Templates (clipboard.html is UPDATED)
 # ============================================
-print_status "5/7: Creating HTML templates..."
+print_status "5/7: Creating HTML templates (Clipboard HTML logic fixed for file-only clips)..."
 
-# --- index.html ---
+# --- index.html --- (No Change)
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -784,7 +787,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html ---
+# --- clipboard.html (V35 - FIX) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -822,7 +825,8 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             {% endfor %}
         </div>
         
-        {% if clip and content %}
+        {# V35 FIX: Check if clip exists AND (has content OR has files_info). This prevents "Clip not found" if only a file is present. #}
+        {% if clip and (content or files_info) %}
             <h1>محتوای کلیپ برای: {{ key }}</h1>
             
             <div class="expiry-info">
@@ -831,15 +835,24 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 
             <div class="content-section">
                 <h2>محتوای متنی</h2>
-                <button class="copy-button" onclick="copyContent()">کپی متن</button>
-                <pre id="text-content">{{ content }}</pre>
+                {% if content %}
+                    <button class="copy-button" onclick="copyContent()">کپی متن</button>
+                    <pre id="text-content">{{ content }}</pre>
+                {% else %}
+                    <p> (این کلیپ حاوی محتوای متنی نیست و فقط دارای فایل ضمیمه می‌باشد) </p>
+                {% endif %}
             </div>
-        {% elif expired %}
-            <h1>کلیپ یافت نشد</h1>
-            <div class="expiry-info">این لینک کلیپ‌بورد منقضی شده است و محتوای آن حذف شده است.</div>
+        
+        {# اگر کلیپ پیدا نشد یا منقضی شده بود #}
         {% else %}
              <h1>کلیپ یافت نشد</h1>
-             <div class="expiry-info">کلیپ با کلید **{{ key }}** وجود ندارد.</div>
+             <div class="expiry-info">
+                 {% if expired %}
+                     این لینک کلیپ‌بورد منقضی شده است و محتوای آن حذف شده است.
+                 {% else %}
+                     کلیپ با کلید **{{ key }}** وجود ندارد.
+                 {% endif %}
+             </div>
         {% endif %}
         
         {% if files_info %}
@@ -873,7 +886,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# --- error.html ---
+# --- error.html --- (No Change)
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -904,9 +917,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V34)
+# 6. Create Systemd Service (Workers set to 2 in V35)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V34 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V35 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -918,7 +931,7 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# V34 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
+# V35 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
 ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -951,7 +964,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V34 - پایدار و بهینه)"
+echo "🎉 نصب کامل شد (Clipboard Server V35 - کاملاً پایدار)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
