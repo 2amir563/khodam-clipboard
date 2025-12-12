@@ -8,6 +8,22 @@ curl -o install_clipboard.sh https://raw.githubusercontent.com/2amir563/khodam-c
 ```
 
 
+بررسی لاگ‌های سرویس (بعد از ایجاد یک کلیپ ناموفق):
+
+Bash
+```
+sudo journalctl -u clipboard.service --since "2 minutes ago"
+```
+بررسی وجود کلیپ در دیتابیس با CLI:
+
+Bash
+
+```
+sudo /opt/clipboard_server/clipboard_cli.sh
+```
+
+# سپس گزینه 2 (لیست تمام کلیپ‌ها) را انتخاب کنید.
+
 ✅ WEB SERVICE STATUS (Port 3214): active
 ------------------------------------------------
 🌐 CLIPBOARD URL (View Only): http://YOUR_IP:3214
