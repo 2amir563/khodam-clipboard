@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V39 - EXPIRY DURATION CHANGE IN CLI: Added option 5 to change the default EXPIRY_DAYS via the CLI.
+# V40 - REMAINING EXPIRY TIME IN CLI: Added a 'Remaining' column to the clip list.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V39 - CLI Expiry Change)"
+echo "📋 Internet Clipboard Server Installer (V40 - Remaining Time in CLI)"
 echo "=================================================="
 
 # ============================================
@@ -38,10 +38,8 @@ echo "=================================================="
 # ============================================
 print_status "1/7: Preparing system, virtual environment, and cleaning old DB..."
 
-# Stop service if running and remove old database files and contents
+# Stop service if running 
 systemctl stop clipboard.service 2>/dev/null || true
-# rm -f "${DATABASE_PATH}" "${DATABASE_PATH}-shm" "${DATABASE_PATH}-wal" # Preserve DB/uploads from V38 onwards
-# rm -rf "${INSTALL_DIR}/uploads/*"
 
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
@@ -77,8 +75,7 @@ mkdir -p "$INSTALL_DIR/uploads"
 # Set ownership to root but allow others to write to uploads (if flask used another user)
 chmod -R 777 "$INSTALL_DIR" 
 
-# --- Create/Update .env file (EXPIRY_DAYS is dynamic now) ---
-# Check if .env exists and has SECRET_KEY, otherwise recreate with defaults
+# --- Create/Update .env file ---
 if [ ! -f "$INSTALL_DIR/.env" ] || ! grep -q "SECRET_KEY" "$INSTALL_DIR/.env"; then
     echo "Creating new .env file."
     cat > "$INSTALL_DIR/.env" << ENVEOF
@@ -88,7 +85,7 @@ CLIPBOARD_PORT=${CLIPBOARD_PORT}
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 else
-    # Update CLIPBOARD_PORT and EXPIRY_DAYS if they don't exist or if we want to reset EXPIRY_DAYS
+    # Update/Ensure keys exist
     sed -i "/^CLIPBOARD_PORT=/c\CLIPBOARD_PORT=${CLIPBOARD_PORT}" "$INSTALL_DIR/.env"
     if ! grep -q "EXPIRY_DAYS" "$INSTALL_DIR/.env"; then
         echo "EXPIRY_DAYS=${EXPIRY_DAYS}" >> "$INSTALL_DIR/.env"
@@ -124,7 +121,7 @@ app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key')
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db') 
 UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
-EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) # V39: Use a distinct name for the default value
+EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
 
@@ -484,9 +481,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V39 - Expiry Duration Change)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V40 - Remaining Time Display)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V39 - Expiry Duration Change)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V40 - Remaining Time Display)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -508,10 +505,10 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
 
-# V39: This variable will be reloaded inside main_menu to get the latest value from .env
+# V40: These variables will be reloaded inside main_menu to get the latest value from .env
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
-BASE_URL = None # Will be set dynamically
+BASE_URL = None 
 
 def get_server_ip():
     """Tries to get the public or local IP of the server."""
@@ -540,7 +537,57 @@ class Color:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-# --- Database Management ---
+# --- Utility Functions for .env management ---
+def update_env_file(key, value):
+    """Update a specific key-value pair in the .env file."""
+    try:
+        if not os.path.exists(DOTENV_PATH):
+            with open(DOTENV_PATH, 'w') as f:
+                f.write(f"{key}={value}\n")
+            return True
+
+        temp_path = DOTENV_PATH + '.tmp'
+        
+        updated = False
+        with open(DOTENV_PATH, 'r') as old, open(temp_path, 'w') as new:
+            for line in old:
+                if line.startswith(f"{key}="):
+                    new.write(f"{key}={value}\n")
+                    updated = True
+                else:
+                    new.write(line)
+            
+            if not updated:
+                new.write(f"{key}={value}\n")
+
+        shutil.move(temp_path, DOTENV_PATH)
+        return True
+    except Exception as e:
+        print(f"{Color.RED}Error updating .env file: {e}{Color.END}")
+        return False
+
+def format_remaining_time(expiry_ts):
+    """Calculates and formats the remaining time until expiry (e.g., 4d 10h)."""
+    now_ts = int(time.time())
+    time_left_sec = expiry_ts - now_ts
+    
+    if time_left_sec <= 0:
+        return "Expired"
+        
+    time_left = timedelta(seconds=time_left_sec)
+    
+    days = time_left.days
+    hours = time_left.seconds // 3600
+    minutes = (time_left.seconds % 3600) // 60
+    
+    if days > 0:
+        return f"{days}d {hours}h"
+    elif hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
+
+# --- Database Management (Init, Cleanup, KeyGen - Same as V39) ---
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -595,35 +642,6 @@ def cleanup_expired_clips():
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     conn.commit()
     conn.close()
-
-# --- Utility Functions for .env management ---
-def update_env_file(key, value):
-    """Update a specific key-value pair in the .env file."""
-    try:
-        if not os.path.exists(DOTENV_PATH):
-            with open(DOTENV_PATH, 'w') as f:
-                f.write(f"{key}={value}\n")
-            return True
-
-        temp_path = DOTENV_PATH + '.tmp'
-        
-        updated = False
-        with open(DOTENV_PATH, 'r') as old, open(temp_path, 'w') as new:
-            for line in old:
-                if line.startswith(f"{key}="):
-                    new.write(f"{key}={value}\n")
-                    updated = True
-                else:
-                    new.write(line)
-            
-            if not updated:
-                new.write(f"{key}={value}\n")
-
-        shutil.move(temp_path, DOTENV_PATH)
-        return True
-    except Exception as e:
-        print(f"{Color.RED}Error updating .env file: {e}{Color.END}")
-        return False
 
 # --- Main CLI Functions ---
 
@@ -720,22 +738,25 @@ def list_clips():
 
     print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
     
-    # Widths: ID:4, Key:12, Link:35, Content:30, Files:6, Expires:20 => Total: 107
-    print(f"{Color.CYAN}{'ID':<4} {'Key':<12} {'Link (IP:Port/Key)':<35} {'Content Preview':<30} {'Files':<6} {'Expires (UTC)':<20}{Color.END}")
-    print("-" * 107)
+    # V40: Added Remaining column (Widths: ID:4, Key:10, Link:30, Content:24, Files:6, Remaining:10, Expires:20 => Total: 104)
+    print(f"{Color.CYAN}{'ID':<4} {'Key':<10} {'Link (IP:Port/Key)':<30} {'Content Preview':<24} {'Files':<6} {'Remaining':<10} {'Expires (UTC)':<20}{Color.END}")
+    print("-" * 104)
     
     for clip in clips:
-        content_preview = (clip['content'][:27] + '...') if clip['content'] and len(clip['content']) > 27 else (clip['content'] or "No content")
+        content_preview = (clip['content'][:21] + '...') if clip['content'] and len(clip['content']) > 21 else (clip['content'] or "No content")
         file_count = len([p for p in clip['file_path'].split(',') if p.strip()]) if clip['file_path'] else 0
         
         expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
         expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
 
+        # V40: Calculate Remaining Time
+        remaining_time = format_remaining_time(clip['expires_at'])
+
         # Prepare and display the full URL
         full_link = f"{SERVER_IP}:{CLIPBOARD_PORT}/{clip['key']}"
         
-        print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<12}{Color.END} {Color.UNDERLINE}{full_link:<35}{Color.END} {content_preview:<30} {file_count:<6} {expiry_date_utc:<20}")
-    print("-" * 107)
+        print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<10}{Color.END} {Color.UNDERLINE}{full_link:<30}{Color.END} {content_preview:<24} {file_count:<6} {remaining_time:<10} {expiry_date_utc:<20}")
+    print("-" * 104)
 
 
 def delete_clip():
@@ -857,7 +878,7 @@ def edit_clip():
 def main_menu():
     global EXPIRY_DAYS, BASE_URL, SERVER_IP
     
-    # V39: Reload configuration before running the menu
+    # V40: Reload configuration before running the menu
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
     EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
     CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
@@ -879,7 +900,7 @@ def main_menu():
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
         print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key or Content)")
         print(f"4. {Color.RED}Delete Clip{Color.END}")
-        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") # V39: New Option
+        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") 
         print("0. Exit")
         
         choice = input("Enter your choice: ").strip()
@@ -892,7 +913,7 @@ def main_menu():
             edit_clip()
         elif choice == '4':
             delete_clip()
-        elif choice == '5': # V39: Handle new option
+        elif choice == '5': 
             change_expiry_days()
         elif choice == '0':
             print(f"\n{Color.BOLD}Exiting CLI Management. Goodbye!{Color.END}")
@@ -1122,9 +1143,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V39)
+# 6. Create Systemd Service (Workers set to 2 in V40)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V39 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V40 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -1168,7 +1189,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V39 - تغییر مدت انقضا در CLI)"
+echo "🎉 نصب کامل شد (Clipboard Server V40 - نمایش زمان باقی‌مانده)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
