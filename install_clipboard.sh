@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V36 - FINAL STABILITY & FORM PERSISTENCE: Form data persists on validation error + Detailed Key validation message.
+# V37 - UNLIMITED SIZE & URL UPLOAD SUPPORT: Removed 50MB limit. Added remote URL upload feature (requires 'requests' library).
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V36 - Final Stable & Form Persistence)"
+echo "📋 Internet Clipboard Server Installer (V37 - Unlimited Size & URL Upload)"
 echo "=================================================="
 
 # ============================================
@@ -57,7 +57,7 @@ source venv/bin/activate || true
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# Ensure dependencies are installed
+# Ensure dependencies are installed (requests added for URL download)
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
@@ -77,19 +77,18 @@ mkdir -p "$INSTALL_DIR/uploads"
 # Set ownership to root but allow others to write to uploads (if flask used another user)
 chmod -R 777 "$INSTALL_DIR" 
 
-# --- Create .env file ---
+# --- Create .env file (MAX_REMOTE_SIZE_MB removed) ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
 SECRET_KEY=${SECRET_KEY}
 EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
-MAX_REMOTE_SIZE_MB=50
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V36 - Form Persistence Logic)
+# 3. Create web_service.py (V37 - URL Upload & No Size Limit)
 # ============================================
-print_status "3/7: Creating web_service.py (V36 - Form Persistence)..."
+print_status "3/7: Creating web_service.py (V37 - URL Upload, No Size Limit)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -101,6 +100,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
 from werkzeug.utils import secure_filename
+import requests # Added for V37 URL upload
 
 # --- Configuration & Init ---
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
@@ -112,7 +112,7 @@ DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipbo
 UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
-MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
+# V37: MAX_CONTENT_LENGTH removed (unlimited size, depends on server resources)
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
 
@@ -121,7 +121,6 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
-            # Crucial V33 fix: isolation_level=None for autocommit/explicit commit and immediate visibility
             db = g._database = sqlite3.connect(
                 DATABASE_PATH, 
                 timeout=10, 
@@ -177,7 +176,63 @@ def cleanup_expired_clips():
             
     # Delete database entries
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
-    db.commit() # Ensure immediate commit for cleanup
+    db.commit() 
+
+def download_and_save_file(url, key, file_paths):
+    """
+    V37: Downloads a file from a URL, saves it, and updates file_paths list.
+    Returns: (bool success, str message)
+    """
+    try:
+        # Basic URL validation
+        if not url.lower().startswith(('http://', 'https://')):
+            return False, "URL must start with http:// or https://."
+            
+        # V37: Disable excessive redirects for security/performance
+        response = requests.get(url, allow_redirects=True, stream=True, timeout=30)
+        
+        if response.status_code != 200:
+            return False, f"HTTP Error {response.status_code} when accessing URL."
+
+        # Determine filename from URL or Content-Disposition
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition:
+            # Try to extract filename from Content-Disposition header
+            fname_match = re.search(r'filename="?([^"]+)"?', content_disposition)
+            if fname_match:
+                filename = fname_match.group(1)
+            else:
+                 filename = os.path.basename(url.split('?', 1)[0])
+        else:
+            filename = os.path.basename(url.split('?', 1)[0])
+            
+        if not filename or filename == '.':
+             filename = "downloaded_file" 
+        
+        # Simple extension check
+        if not allowed_file(filename):
+            return False, f"File type not allowed for downloaded file: {filename}"
+        
+        filename = secure_filename(filename)
+        unique_filename = f"{key}_{filename}"
+        full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        # Save file to disk
+        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        file_paths.append(full_path)
+        return True, filename
+
+    except requests.exceptions.Timeout:
+        return False, "Download failed: Connection timed out (30 seconds limit)."
+    except requests.exceptions.RequestException as e:
+        return False, f"Download failed: {e}"
+    except Exception as e:
+        return False, f"An unexpected error occurred during download: {e}"
+
 
 # --- Main Routes ---
 
@@ -188,35 +243,38 @@ def index():
     context = {
         'EXPIRY_DAYS': EXPIRY_DAYS,
         'old_content': '',
-        'old_custom_key': ''
+        'old_custom_key': '',
+        'old_url_files': '' # V37: For persistence of remote URLs
     }
 
     # 1. Handle form submission (POST)
     if request.method == 'POST':
-        content = request.form.get('content', '') # Keep unstripped for form persistence
+        content = request.form.get('content', '') 
         custom_key = request.form.get('custom_key', '').strip()
+        url_files_input = request.form.get('url_files', '') # V37: Get URL input
         
         uploaded_files = request.files.getlist('files')
-        
-        # V36: Update context for re-rendering if error occurs
+        url_list = [u.strip() for u in url_files_input.split('\n') if u.strip()] # V37: Split URLs
+
+        # V36/V37: Update context for re-rendering if error occurs
         context['old_content'] = content
         context['old_custom_key'] = custom_key
+        context['old_url_files'] = url_files_input
         
         content_stripped = content.strip()
-        has_content = content_stripped or any(f.filename for f in uploaded_files)
+        has_content = content_stripped or any(f.filename for f in uploaded_files) or url_list
         
         if not has_content:
-            flash('Please provide text content or upload at least one file.', 'error')
-            return render_template('index.html', **context) # V36: No redirect
+            flash('Please provide text content, upload files, or paste file URLs.', 'error')
+            return render_template('index.html', **context) 
 
         key = custom_key or generate_key()
         
-        # V36: Validation and checks
+        # Validation and checks
         KEY_REGEX_STR = r'^[a-zA-Z0-9_-]{3,64}$'
         if custom_key and not re.match(KEY_REGEX_STR, custom_key):
-            # V36: Detailed error message
             flash('Invalid custom key format. Key must be 3 to 64 letters, numbers, hyphens (-) or underscores (_).', 'error')
-            return render_template('index.html', **context) # V36: No redirect
+            return render_template('index.html', **context) 
             
         try:
             db = get_db()
@@ -224,31 +282,49 @@ def index():
             cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
             if cursor.fetchone():
                 flash(f'The key "{key}" is already in use. Please choose another key.', 'error')
-                return render_template('index.html', **context) # V36: No redirect
+                return render_template('index.html', **context) 
         except RuntimeError:
             flash("Database connection error.", 'error')
-            return render_template('index.html', **context) # V36: No redirect
+            return render_template('index.html', **context) 
             
-        # File Handling... 
+        # File Handling (Local & Remote)
         file_paths = []
-        try:
-            for file in uploaded_files:
-                if file and file.filename and allowed_file(file.filename):
+        has_upload_error = False
+
+        # 1. Local File Upload
+        for file in uploaded_files:
+            if file and file.filename:
+                if allowed_file(file.filename):
                     filename = secure_filename(file.filename)
                     unique_filename = f"{key}_{filename}"
                     full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-                    file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
-                    file_paths.append(full_path)
-                elif file.filename and not allowed_file(file.filename):
-                     flash(f'File type not allowed: {file.filename}', 'error')
-                     return render_template('index.html', **context) # V36: No redirect
-                     
-        except Exception as e:
-            flash(f'File upload error: {e}', 'error')
+                    try:
+                        file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
+                        file_paths.append(full_path)
+                    except Exception as e:
+                        flash(f'Error saving local file {filename}: {e}', 'error')
+                        has_upload_error = True
+                        break
+                else:
+                    flash(f'Local file type not allowed: {file.filename}', 'error')
+                    has_upload_error = True
+                    break
+        
+        # 2. Remote URL Download (V37)
+        if not has_upload_error:
+            for url in url_list:
+                success, msg = download_and_save_file(url, key, file_paths)
+                if not success:
+                    flash(f'Remote download failed for {url}: {msg}', 'error')
+                    has_upload_error = True
+                    break
+            
+        # If any error occurred during file handling (local or remote), clean up and return
+        if has_upload_error:
             for fp in file_paths:
                 try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
                 except: pass
-            return render_template('index.html', **context) # V36: No redirect
+            return render_template('index.html', **context) 
             
         # Database Insertion
         created_at_ts = int(time.time())
@@ -258,9 +334,8 @@ def index():
         try:
             cursor.execute(
                 "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (key, content_stripped, file_path_string, created_at_ts, expires_at_ts) # Use stripped content for DB
+                (key, content_stripped, file_path_string, created_at_ts, expires_at_ts) 
             )
-            # Crucial: Commit immediately after INSERT, using rollback journal mode guarantees visibility.
             db.commit() 
             
             # Redirect to the newly created clip
@@ -269,7 +344,10 @@ def index():
         except sqlite3.OperationalError as e:
              print(f"SQLITE ERROR: {e}")
              flash("Database error during clip creation. Check server logs.", 'error')
-             return render_template('index.html', **context) # V36: No redirect
+             for fp in file_paths: # Clean up uploaded files if DB fails
+                try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
+                except: pass
+             return render_template('index.html', **context)
 
 
     # 2. Handle GET request (Display form)
@@ -278,7 +356,7 @@ def index():
     except RuntimeError:
          flash("Database connection error during cleanup. Please run CLI tool.", 'error')
     
-    return render_template('index.html', **context) # Render with default context for GET
+    return render_template('index.html', **context)
 
 
 @app.route('/<key>')
@@ -389,9 +467,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V36)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V37)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V36)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V37)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -722,11 +800,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (index.html UPDATED for persistence)
+# 5. Create Minimal Templates (index.html UPDATED for persistence and URL input)
 # ============================================
-print_status "5/7: Creating HTML templates (index.html updated for form persistence)..."
+print_status "5/7: Creating HTML templates (index.html updated for URL upload)..."
 
-# --- index.html (V36 Fix) ---
+# --- index.html (V37 Fix) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -777,18 +855,22 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         <form method="POST" enctype="multipart/form-data">
             <div>
                 <label for="content">محتوای متنی (اختیاری):</label>
-                {# V36 FIX: Preserve content on error #}
                 <textarea id="content" name="content" placeholder="متن خود را اینجا بچسبانید...">{{ old_content }}</textarea>
             </div>
             
             <div>
-                <label for="files">آپلود فایل (اختیاری - حداکثر 50 مگابایت):</label>
+                <label for="files">آپلود فایل محلی (اختیاری):</label>
                 <input type="file" id="files" name="files" multiple>
             </div>
             
+             {# V37: New field for URL uploads #}
+            <div>
+                <label for="url_files">آپلود فایل از طریق لینک URL (اختیاری - هر لینک در یک خط جدا):</label>
+                <textarea id="url_files" name="url_files" placeholder="لینک فایل‌ها را وارد کنید...">{{ old_url_files }}</textarea>
+            </div>
+
             <div>
                 <label for="custom_key">کلید لینک سفارشی (اختیاری، مثال: 'my-secret-key'):</label>
-                {# V36 FIX: Preserve custom_key on error #}
                 <input type="text" id="custom_key" name="custom_key" placeholder="برای کلید تصادفی خالی بگذارید" value="{{ old_custom_key }}">
             </div>
             
@@ -934,9 +1016,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V36)
+# 6. Create Systemd Service (Workers set to 2 in V37)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V36 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V37 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -948,7 +1030,6 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# V36 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
 ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -981,7 +1062,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V36 - کاملاً پایدار)"
+echo "🎉 نصب کامل شد (Clipboard Server V37 - نامحدود و URL)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
