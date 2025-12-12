@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V35 - FINAL STABILITY & OPTIMIZATION: SQLite fix (no WAL) + Gunicorn Workers set to 2 + HTML template fix for file-only clips.
+# V36 - FINAL STABILITY & FORM PERSISTENCE: Form data persists on validation error + Detailed Key validation message.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V35 - Final Stable & Optimized)"
+echo "📋 Internet Clipboard Server Installer (V36 - Final Stable & Form Persistence)"
 echo "=================================================="
 
 # ============================================
@@ -87,9 +87,9 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V33 Logic - Explicit Isolation, Unix Time)
+# 3. Create web_service.py (V36 - Form Persistence Logic)
 # ============================================
-print_status "3/7: Creating web_service.py (V35 - SQLite stability confirmed)..."
+print_status "3/7: Creating web_service.py (V36 - Form Persistence)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -184,24 +184,39 @@ def cleanup_expired_clips():
 @app.route('/', methods=['GET', 'POST'])
 def index():
     
+    # V36: Initialize default context for GET and error POSTs
+    context = {
+        'EXPIRY_DAYS': EXPIRY_DAYS,
+        'old_content': '',
+        'old_custom_key': ''
+    }
+
     # 1. Handle form submission (POST)
     if request.method == 'POST':
-        content = request.form.get('content', '').strip()
+        content = request.form.get('content', '') # Keep unstripped for form persistence
         custom_key = request.form.get('custom_key', '').strip()
         
         uploaded_files = request.files.getlist('files')
-        has_content = content or any(f.filename for f in uploaded_files)
+        
+        # V36: Update context for re-rendering if error occurs
+        context['old_content'] = content
+        context['old_custom_key'] = custom_key
+        
+        content_stripped = content.strip()
+        has_content = content_stripped or any(f.filename for f in uploaded_files)
         
         if not has_content:
             flash('Please provide text content or upload at least one file.', 'error')
-            return redirect(url_for('index'))
+            return render_template('index.html', **context) # V36: No redirect
 
         key = custom_key or generate_key()
         
-        # Validation and checks... (omitted for brevity)
-        if custom_key and not re.match(KEY_REGEX, custom_key):
-            flash('Invalid custom key format.', 'error')
-            return redirect(url_for('index'))
+        # V36: Validation and checks
+        KEY_REGEX_STR = r'^[a-zA-Z0-9_-]{3,64}$'
+        if custom_key and not re.match(KEY_REGEX_STR, custom_key):
+            # V36: Detailed error message
+            flash('Invalid custom key format. Key must be 3 to 64 letters, numbers, hyphens (-) or underscores (_).', 'error')
+            return render_template('index.html', **context) # V36: No redirect
             
         try:
             db = get_db()
@@ -209,12 +224,12 @@ def index():
             cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
             if cursor.fetchone():
                 flash(f'The key "{key}" is already in use. Please choose another key.', 'error')
-                return redirect(url_for('index'))
+                return render_template('index.html', **context) # V36: No redirect
         except RuntimeError:
             flash("Database connection error.", 'error')
-            return redirect(url_for('index'))
+            return render_template('index.html', **context) # V36: No redirect
             
-        # File Handling... (omitted for brevity)
+        # File Handling... 
         file_paths = []
         try:
             for file in uploaded_files:
@@ -226,16 +241,16 @@ def index():
                     file_paths.append(full_path)
                 elif file.filename and not allowed_file(file.filename):
                      flash(f'File type not allowed: {file.filename}', 'error')
-                     return redirect(url_for('index'))
+                     return render_template('index.html', **context) # V36: No redirect
                      
         except Exception as e:
             flash(f'File upload error: {e}', 'error')
             for fp in file_paths:
                 try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
                 except: pass
-            return redirect(url_for('index'))
+            return render_template('index.html', **context) # V36: No redirect
             
-        # Database Insertion (V33: Final Commit)
+        # Database Insertion
         created_at_ts = int(time.time())
         expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
         file_path_string = ','.join(file_paths)
@@ -243,7 +258,7 @@ def index():
         try:
             cursor.execute(
                 "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (key, content, file_path_string, created_at_ts, expires_at_ts)
+                (key, content_stripped, file_path_string, created_at_ts, expires_at_ts) # Use stripped content for DB
             )
             # Crucial: Commit immediately after INSERT, using rollback journal mode guarantees visibility.
             db.commit() 
@@ -254,7 +269,7 @@ def index():
         except sqlite3.OperationalError as e:
              print(f"SQLITE ERROR: {e}")
              flash("Database error during clip creation. Check server logs.", 'error')
-             return redirect(url_for('index'))
+             return render_template('index.html', **context) # V36: No redirect
 
 
     # 2. Handle GET request (Display form)
@@ -263,7 +278,7 @@ def index():
     except RuntimeError:
          flash("Database connection error during cleanup. Please run CLI tool.", 'error')
     
-    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
+    return render_template('index.html', **context) # Render with default context for GET
 
 
 @app.route('/<key>')
@@ -374,9 +389,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V35)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V36)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V35)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V36)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -707,11 +722,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (clipboard.html is UPDATED)
+# 5. Create Minimal Templates (index.html UPDATED for persistence)
 # ============================================
-print_status "5/7: Creating HTML templates (Clipboard HTML logic fixed for file-only clips)..."
+print_status "5/7: Creating HTML templates (index.html updated for form persistence)..."
 
-# --- index.html --- (No Change)
+# --- index.html (V36 Fix) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -762,7 +777,8 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         <form method="POST" enctype="multipart/form-data">
             <div>
                 <label for="content">محتوای متنی (اختیاری):</label>
-                <textarea id="content" name="content" placeholder="متن خود را اینجا بچسبانید..."></textarea>
+                {# V36 FIX: Preserve content on error #}
+                <textarea id="content" name="content" placeholder="متن خود را اینجا بچسبانید...">{{ old_content }}</textarea>
             </div>
             
             <div>
@@ -772,7 +788,8 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             
             <div>
                 <label for="custom_key">کلید لینک سفارشی (اختیاری، مثال: 'my-secret-key'):</label>
-                <input type="text" id="custom_key" name="custom_key" placeholder="برای کلید تصادفی خالی بگذارید">
+                {# V36 FIX: Preserve custom_key on error #}
+                <input type="text" id="custom_key" name="custom_key" placeholder="برای کلید تصادفی خالی بگذارید" value="{{ old_custom_key }}">
             </div>
             
             <input type="submit" value="ایجاد کلیپ (در {{ EXPIRY_DAYS }} روز منقضی می‌شود)">
@@ -787,7 +804,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (V35 - FIX) ---
+# --- clipboard.html (V35 Logic) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -917,9 +934,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V35)
+# 6. Create Systemd Service (Workers set to 2 in V36)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V35 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V36 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -931,7 +948,7 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# V35 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
+# V36 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
 ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -964,7 +981,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V35 - کاملاً پایدار)"
+echo "🎉 نصب کامل شد (Clipboard Server V36 - کاملاً پایدار)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
