@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Simple Web Viewer)
-# V22 - Light mode: Removes Admin Web Panel and replaces it with a command-line interface (CLI).
+# V23 - FINAL STABILITY FIX: Ensures database initialization before web service start.
 
 set -e
 
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V22 - CLI/Light Mode)"
+echo "📋 Internet Clipboard Server Installer (V23 - Final Stable CLI/Light Mode)"
 echo "=================================================="
 
 # ============================================
@@ -89,7 +89,7 @@ import re
 import requests
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g, session, abort
+from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
 
 # --- Configuration & Init ---
@@ -98,16 +98,19 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
+# IMPORTANT: Use absolute path for DB connection
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db') 
 UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
-MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
 
 # --- Database Management ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
+        # Check if DB file exists before connecting, if not, it should be created by CLI
+        if not os.path.exists(DATABASE_PATH):
+            print(f"CRITICAL: Database file not found at {DATABASE_PATH}. Service may fail.")
         db = g._database = sqlite3.connect(DATABASE_PATH)
         db.row_factory = sqlite3.Row 
     return db
@@ -124,19 +127,21 @@ def cleanup_expired_clips():
     cursor = db.cursor()
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
+    # Delete files associated with expired clips
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
     expired_files = cursor.fetchall()
 
     for file_path_tuple in expired_files:
-        file_paths = file_path_tuple[0].split(',') if file_path_tuple[0] else []
+        file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
         for file_path in file_paths:
             full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
             if file_path and os.path.exists(full_path):
                 try:
                     os.remove(full_path)
                 except OSError as e:
-                    print(f"Error removing file {full_path}: {e}")
+                    print(f"[WARNING] Error removing file {full_path}: {e}")
             
+    # Delete clips from DB
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
     db.commit()
 
@@ -146,17 +151,21 @@ def cleanup_expired_clips():
 @app.route('/')
 def index():
     cleanup_expired_clips()
-    # The main page is just a prompt to use the CLI tool now
     return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
 
 
 @app.route('/<key>')
 def view_clip(key):
     cleanup_expired_clips()
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
-    clip = cursor.fetchone()
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
+        clip = cursor.fetchone()
+    except sqlite3.OperationalError as e:
+        # This catches errors like 'no such table: clips' which is the underlying cause of Internal Server Error
+        print(f"SQLITE ERROR: {e}")
+        return render_template('error.html', message="Database is not initialized or corrupted. Please run the CLI tool on the server to fix."), 500
 
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
@@ -181,10 +190,13 @@ def view_clip(key):
     for p in file_paths_list:
         if p.strip():
             filename_with_key = os.path.basename(p.strip())
-            original_filename = filename_with_key.split('_', 2)[-1] 
+            # Safely extract original filename
+            try:
+                original_filename = filename_with_key.split('_', 2)[-1] 
+            except IndexError:
+                 original_filename = filename_with_key
             files_info.append({'path': p.strip(), 'name': original_filename})
 
-    # Note: We do not handle create_clip or upload here, only viewing.
 
     return render_template('clipboard.html', 
                            key=key, 
@@ -254,6 +266,7 @@ PYEOF_WEB_SERVICE
 # 4. Create clipboard_cli.py (The new Admin/Create Tool)
 # ============================================
 print_status "4/6: Creating clipboard_cli.py (New CLI Management Tool)..."
+# The content of clipboard_cli.py is the same as V22, but we include it here for completeness
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -273,9 +286,9 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
-BASE_URL = f"http://YOUR_IP:{os.getenv('CLIPBOARD_PORT', '3214')}" 
+CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
+BASE_URL = f"http://YOUR_IP:{CLIPBOARD_PORT}" 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-# MAX_REMOTE_SIZE_BYTES is not used here as remote file download must be managed via web interface or external tools now.
 
 # --- Colors ---
 class Color:
@@ -328,7 +341,6 @@ def cleanup_expired_clips():
     cursor = conn.cursor()
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-    # Delete files associated with expired clips
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
     expired_files = cursor.fetchall()
 
@@ -342,7 +354,6 @@ def cleanup_expired_clips():
                 except OSError as e:
                     print(f"[{Color.YELLOW}WARNING{Color.END}] Error removing file {full_path}: {e}")
             
-    # Delete clips from DB
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
     conn.commit()
     conn.close()
@@ -433,7 +444,6 @@ def delete_clip():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Try to find the clip by ID or Key
     if clip_id_or_key.isdigit():
         cursor.execute("SELECT id, key, file_path FROM clips WHERE id = ?", (int(clip_id_or_key),))
     else:
@@ -449,7 +459,6 @@ def delete_clip():
     clip_id = clip['id']
     clip_key = clip['key']
     
-    # Delete associated files
     if clip['file_path']:
         file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
         for file_path in file_paths:
@@ -458,7 +467,6 @@ def delete_clip():
                 os.remove(full_path)
                 print(f" - Deleted file: {os.path.basename(file_path)}")
                 
-    # Delete from DB
     cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
     conn.commit()
     conn.close()
@@ -519,11 +527,9 @@ def edit_clip():
         print(f"\n{Color.YELLOW}--- Current Content ---{Color.END}")
         print(clip['content'] if clip['content'] else "(Empty)")
         print("---------------------------------------")
-        new_content = input("Enter new content (or press Ctrl+D/Ctrl+Z to cancel): ").strip()
+        print(f"Type new content. Press {Color.BOLD}Ctrl+D{Color.END} (or Ctrl+Z on Windows), then Enter, to save and finish.")
         
-        # Simple multi-line input handling (Note: this is basic)
         content_lines = []
-        print(f"Type content. Press Ctrl+D/Ctrl+Z, then Enter, to finish.")
         try:
             while True:
                 line = sys.stdin.readline()
@@ -533,7 +539,7 @@ def edit_clip():
             new_content = "\n".join(content_lines)
         except EOFError:
             new_content = "\n".join(content_lines)
-
+            
         cursor.execute("UPDATE clips SET content = ? WHERE id = ?", (new_content, clip_id))
         conn.commit()
         print(f"\n{Color.GREEN}✅ Content updated successfully.{Color.END}")
@@ -546,6 +552,11 @@ def edit_clip():
 def main_menu():
     init_db()
     cleanup_expired_clips()
+    
+    # Check if this is being called from the installer as a one-off task
+    if len(sys.argv) > 1 and sys.argv[1] == '--init-db':
+        print(f"[{Color.GREEN}INFO{Color.END}] Database checked/initialized successfully.")
+        return
 
     while True:
         print(f"\n{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
@@ -606,7 +617,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         <div class="cli-note">
             To create or manage clips (text or files), you must connect to the server via SSH and use the Command Line Interface (CLI) tool:
             <br>
-            <code>sudo python3 /opt/clipboard_server/clipboard_cli.py</code>
+            <code>sudo /opt/clipboard_server/venv/bin/python3 /opt/clipboard_server/clipboard_cli.py</code>
         </div>
     </div>
 </body>
@@ -614,7 +625,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 INDEXEOF
 
 # --- clipboard.html (Same as before, only for viewing data) ---
-# NOTE: This is the same file as V21, but now it's guaranteed to be created.
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -703,13 +713,39 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# Note: We skip login.html, admin.html, edit_key.html, edit_content.html as they are no longer needed.
-
+# --- error.html (New simple error page) ---
+cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Error</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
+        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #dc3545; margin-bottom: 20px; }
+        p { font-size: 1.1em; color: #555; }
+        .error-message { margin-top: 30px; padding: 15px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; color: #721c24; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>❌ Internal Error</h1>
+        <div class="error-message">
+            <p>{{ message }}</p>
+        </div>
+        <p>This is likely a server configuration issue.</p>
+        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
+    </div>
+</body>
+</html>
+ERROREOF
 
 # ============================================
 # 6. Create Systemd Service (Single Service for Web View)
 # ============================================
-print_status "6/6: Creating Systemd service for light web view..."
+print_status "6/7: Creating Systemd service for light web view..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -737,8 +773,9 @@ SERVICEEOF
 # ============================================
 print_status "7/7: Initializing Database and starting service..."
 
-# Initialize DB using the venv Python
-"$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py"
+# Initialize DB using the venv Python, ensuring the database file and table exist BEFORE Gunicorn starts
+# We use the special --init-db flag to prevent the CLI menu from appearing during installation
+"$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py" --init-db 
 
 systemctl daemon-reload
 systemctl enable clipboard.service
@@ -746,7 +783,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V22 - CLI/Light Mode)"
+echo "🎉 Installation Complete (Clipboard Server V23 - Final Stable CLI/Light Mode)"
 echo "================================================"
 echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
@@ -756,5 +793,5 @@ echo "💻 ADMIN/CREATION: Use the Command Line Interface (CLI)!"
 echo -e "   ${BLUE}sudo ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py${NC}"
 echo "------------------------------------------------"
 echo "Status:   sudo systemctl status clipboard.service"
-echo "Restart:  sudo systemctl restart clipboard.service"
+echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
