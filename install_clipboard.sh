@@ -1,6 +1,6 @@
 #!/bin/bash
-# Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V20 - FINAL: Critical Fix for Internal Server Error on Admin Login/Index. Ensures robust .env loading.
+# Internet Clipboard Server Installer (CLI Management + Simple Web Viewer)
+# V22 - Light mode: Removes Admin Web Panel and replaces it with a command-line interface (CLI).
 
 set -e
 
@@ -15,69 +15,32 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 
 print_status() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 # Check root access
-if [ "$EUID" -ne 0 ] && [ "$1" != "setup-user" ]; then
+if [ "$EUID" -ne 0 ]; then
     print_error "❌ Please run with root access: sudo bash install_clipboard.sh"
     exit 1
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V20 - Final Stability Fix)"
+echo "📋 Internet Clipboard Server Installer (V22 - CLI/Light Mode)"
 echo "=================================================="
 
 # ============================================
-# 1. Password Input Phase (FORCED)
+# 1. System Setup & Venv
 # ============================================
-echo ""
-echo "🛑 SECURITY SETUP: Admin Panel Password"
-echo "------------------------------------------------"
-
-# Loop until a valid, matching password is provided
-while true; do
-    read -s -p "Enter a strong Admin Password: " ADMIN_PASSWORD
-    echo ""
-    read -s -p "Confirm Admin Password: " ADMIN_PASSWORD_CONFIRM
-    echo ""
-
-    if [ -z "$ADMIN_PASSWORD" ]; then
-        print_error "❌ Password cannot be empty. Please try again."
-        continue
-    fi
-
-    if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
-        print_error "❌ Passwords do not match. Please try again."
-        continue
-    fi
-    
-    # Simple length check to enforce minimum strength
-    if [ ${#ADMIN_PASSWORD} -lt 8 ]; then
-        print_error "❌ Password is too short. It must be at least 8 characters long."
-        continue
-    fi
-
-    break 
-done
-
-echo "------------------------------------------------"
-print_status "Password successfully set."
-echo ""
-
-# ============================================
-# 2. System Setup & Venv
-# ============================================
-print_status "2/7: Ensuring system setup and Virtual Environment..."
+print_status "1/6: Ensuring system setup and Virtual Environment..."
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
 
-# Install dependencies needed for password hashing (werkzeug)
 if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
@@ -86,27 +49,24 @@ source venv/bin/activate || true
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
+# Using a minimal list of dependencies
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
 gunicorn
 requests
-werkzeug
 REQEOF
 pip install -r requirements.txt || true
 deactivate
 
 # ============================================
-# 3. Update .env and Directories
+# 2. Update .env and Directories
 # ============================================
-print_status "3/7: Updating configuration and ensuring directory structure..."
+print_status "2/6: Updating configuration and ensuring directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
 chmod 777 "$INSTALL_DIR/uploads" 
-
-# Hash the password for secure storage
-ADMIN_PASSWORD_HASH=$(echo "$ADMIN_PASSWORD" | "$PYTHON_VENV_PATH" -c "from werkzeug.security import generate_password_hash; import sys; print(generate_password_hash(sys.stdin.read().strip()))")
 
 # --- Create .env file ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
@@ -114,56 +74,35 @@ SECRET_KEY=${SECRET_KEY}
 EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
 MAX_REMOTE_SIZE_MB=50
-ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 # Path added for robust manual loading
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 4. Create app.py (V20 - Fixed .env loading and variable access)
+# 3. Create web_service.py (Simplified Flask for view only)
 # ============================================
-print_status "4/7: Creating app.py (V20 - Critical fix for admin panel access)..."
-cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP_MERGED_V20'
+print_status "3/6: Creating web_service.py (Simplified view-only web server)..."
+cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
-import random
-import string
 import re
 import requests
 import urllib.parse
-import sys
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g, session, abort
-from dotenv import load_dotenv, set_key, find_dotenv
-from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv, find_dotenv
 
-# --- Determine .env Path Globally ---
+# --- Configuration & Init ---
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
-if not DOTENV_PATH:
-    DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-
-# Load the environment variables globally (Essential for initial setup)
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
-
-# --- Configuration (Read from OS Env or the loaded .env) ---
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
-KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
+EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
-
-# Function to safely get the current admin hash
-def get_admin_password_hash():
-    # Reload the .env file content directly before checking/using the hash
-    # This prevents the initial global load from failing and ensures the latest hash is used
-    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
-    return os.getenv('ADMIN_PASSWORD_HASH')
-
 
 # --- Database Management ---
 def get_db():
@@ -179,45 +118,7 @@ def close_connection(exception):
     if db is not None:
         db.close()
 
-def init_db():
-    with app.app_context():
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS clips (
-                id INTEGER PRIMARY KEY,
-                key TEXT UNIQUE NOT NULL,
-                content TEXT,
-                file_path TEXT, 
-                created_at DATETIME NOT NULL,
-                expires_at DATETIME NOT NULL
-            )
-        """)
-        db.commit()
-
-# --- Security Decorator: Admin Authentication ---
-def login_required(f):
-    def wrap(*args, **kwargs):
-        if not session.get('logged_in'):
-            flash('Login required to access the admin panel.', 'error')
-            return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    wrap.__name__ = f.__name__
-    return login_required
-
-
-# --- Helper Functions (Remaining functions are unchanged from V19) ---
-def generate_key(length=8):
-    characters = string.ascii_letters + string.digits
-    db = get_db()
-    cursor = db.cursor()
-    while True:
-        key = ''.join(random.choice(characters) for i in range(length))
-        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
-        exists = cursor.fetchone()
-        if not exists:
-            return key
-
+# --- Cleanup (Only runs on view/index access) ---
 def cleanup_expired_clips():
     db = get_db()
     cursor = db.cursor()
@@ -240,241 +141,18 @@ def cleanup_expired_clips():
     db.commit()
 
 
-def download_remote_file(url, key_prefix, index):
-    try:
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            
-            content_length = r.headers.get('Content-Length')
-            if content_length and int(content_length) > MAX_REMOTE_SIZE_BYTES:
-                return "File size exceeds limit."
-            
-            filename = f"file_{index}"
-            if 'Content-Disposition' in r.headers:
-                filename_header = r.headers['Content-Disposition']
-                match = re.search(r'filename=["\']?([^"\']+)["\']?', filename_header)
-                if match:
-                    filename = match.group(1)
-            
-            if filename == f"file_{index}":
-                path = urllib.parse.urlparse(url).path
-                filename = os.path.basename(path)
-                if not filename or filename.count('.') < 1:
-                    filename = f"remote_file_{index}.bin" 
-            
-            safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
-            
-            file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key_prefix}_{index}_{safe_filename}")
-            file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
-            
-            downloaded_size = 0
-            with open(file_path_absolute, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        downloaded_size += len(chunk)
-                        if downloaded_size > MAX_REMOTE_SIZE_BYTES:
-                            f.close()
-                            os.remove(file_path_absolute)
-                            return "File size exceeds limit during download."
-                        f.write(chunk)
-            
-            return file_path_relative 
-            
-    except requests.exceptions.RequestException as e:
-        return f"Error downloading file: {e}"
-    except Exception as e:
-        return f"An unexpected error occurred: {e}"
-
-# --- Command Line Utility for Password Reset ---
-def reset_admin_password():
-    """Allows admin password reset from command line."""
-    print("\n--- Clipboard Server Admin Password Reset Utility ---")
-    
-    if not os.path.exists(DOTENV_PATH):
-        print(f"Error: .env file not found at {DOTENV_PATH}")
-        sys.exit(1)
-
-    while True:
-        try:
-            new_password = input("Enter new admin password: ")
-            confirm_password = input("Confirm new admin password: ")
-
-            if not new_password:
-                print("Password cannot be empty. Try again.")
-                continue
-
-            if new_password != confirm_password:
-                print("Passwords do not match. Try again.")
-                continue
-            
-            if len(new_password) < 8:
-                print("Password is too short. It must be at least 8 characters long.")
-                continue
-
-            break
-        except EOFError:
-            print("\nReset cancelled.")
-            sys.exit(0)
-        except Exception as e:
-            print(f"An unexpected input error occurred: {e}")
-            sys.exit(1)
-
-    # Hash the new password
-    new_hash = generate_password_hash(new_password)
-    
-    # Save the new hash to the .env file
-    try:
-        success = set_key(DOTENV_PATH, "ADMIN_PASSWORD_HASH", new_hash)
-        if success:
-            print("\n✅ Admin password hash updated successfully in .env file.")
-            print("⚠️ REMINDER: You must restart the clipboard service for changes to take effect.")
-            print("   Command: sudo systemctl restart clipboard.service")
-        else:
-            print("\n❌ Failed to update the .env file. Check file permissions.")
-            sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Error saving to .env file: {e}")
-        sys.exit(1)
-
-# --- Flask Routes (The problem was here and in get_admin_password_hash) ---
+# --- Simple Routes (No Admin Panel) ---
 
 @app.route('/')
 def index():
     cleanup_expired_clips()
-    
-    old_data = {}
-    messages = list(request.args.get('flash_messages', '').split('||')) 
-    display_messages = []
-    
-    for message in messages:
-        if message:
-            try:
-                category, msg_content = message.split(':', 1)
-                if category == 'form_data':
-                    data = eval(msg_content)
-                    if isinstance(data, dict):
-                        old_data = data
-                else:
-                    display_messages.append((category, msg_content))
-            except:
-                continue 
-            
-    from flask import get_flashed_messages
-    for category, message in get_flashed_messages(with_categories=True):
-        if category != 'form_data':
-            display_messages.append((category, message))
-
-
-    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS, old_data=old_data, flashed_messages=display_messages)
-
-
-@app.route('/create', methods=['POST'])
-# ... (create_clip function is unchanged)
-def create_clip():
-    content = request.form.get('content')
-    uploaded_files = request.files.getlist('files[]')
-    remote_urls_input = request.form.get('remote_urls', '').strip()
-    custom_key = request.form.get('custom_key', '').strip()
-
-    is_content_empty = not content
-    is_local_files_empty = not any(f.filename for f in uploaded_files)
-    is_remote_urls_empty = not remote_urls_input
-
-    if is_content_empty and is_local_files_empty and is_remote_urls_empty:
-        flash('You must provide text, local files, or remote URLs.', 'error')
-        return redirect(url_for('index'))
-
-    form_data_for_flash = {'content': content, 'custom_key': custom_key, 'remote_urls': remote_urls_input}
-    error_messages = []
-
-    key = None
-    if custom_key:
-        if not re.match(KEY_REGEX, custom_key):
-            error_messages.append('error:Custom key must contain only English letters, numbers, hyphen (-), or underscore (_) and be between 3 and 64 characters long.')
-        else:
-            key = custom_key
-            db = get_db()
-            cursor = db.cursor()
-            cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
-            if cursor.fetchone():
-                error_messages.append(f'error:❌ Error: Key **{key}** is already taken. Please choose another name.')
-    
-    if error_messages:
-        flash_args = "||".join([f'form_data:{str(form_data_for_flash)}'] + error_messages)
-        return redirect(url_for('index', flash_messages=flash_args))
-
-    if not key:
-        key = generate_key()
-
-    file_paths_list = []
-    
-    remote_index_start = 0
-    if uploaded_files:
-        for i, uploaded_file in enumerate(uploaded_files):
-            if uploaded_file and uploaded_file.filename:
-                filename = uploaded_file.filename
-                file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{i}_{filename}") 
-                file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
-                uploaded_file.save(file_path_absolute)
-                file_paths_list.append(file_path_relative)
-                remote_index_start = i + 1
-
-    
-    remote_urls = [url.strip() for url in remote_urls_input.split('\n') if url.strip()]
-    
-    if remote_urls:
-        downloaded_count = 0
-        for i, url in enumerate(remote_urls):
-            if not url.startswith(('http://', 'https://')):
-                error_messages.append(f'error:Remote URL #{i+1} is not valid (must start with http:// or https://): {url[:50]}...')
-                continue
-            
-            download_index = remote_index_start + i
-            download_result = download_remote_file(url, key, download_index)
-            
-            if download_result.startswith("Error") or download_result.startswith("File size"):
-                error_messages.append(f'error:❌ File Download Error for URL #{i+1}: {download_result}')
-            else:
-                file_paths_list.append(download_result)
-                downloaded_count += 1
-
-    file_path_string = ','.join(file_paths_list)
-
-    if error_messages:
-        flash_args = "||".join([f'form_data:{str(form_data_for_flash)}'] + error_messages)
-        return redirect(url_for('index', flash_messages=flash_args))
-
-    if not content and file_paths_list:
-        content = "Files attached:\n" + "\n".join([f"{os.path.basename(p).split('_', 2)[-1]}" for p in file_paths_list])
-
-    if not content and not file_paths_list:
-        error_messages.append('error:You must have content or a file to save.')
-        flash_args = "||".join([f'form_data:{str(form_data_for_flash)}'] + error_messages)
-        return redirect(url_for('index', flash_messages=flash_args))
-
-    expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
-
-    try:
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (key, content, file_path_string, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
-        )
-        db.commit()
-        
-        flash(f'✅ Clipboard successfully created! Link: {url_for("view_clip", key=key, _external=True)}', 'success')
-        return redirect(url_for('view_clip', key=key))
-        
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        flash('❌ An internal error occurred while saving.', 'error')
-        return redirect(url_for('index'))
+    # The main page is just a prompt to use the CLI tool now
+    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
 
 
 @app.route('/<key>')
-# ... (view_clip and download_file functions are unchanged)
 def view_clip(key):
+    cleanup_expired_clips()
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -497,10 +175,6 @@ def view_clip(key):
     hours = time_left.seconds // 3600
     minutes = (time_left.seconds % 3600) // 60
     
-    expiry_info_days = days
-    expiry_info_hours = hours
-    expiry_info_minutes = minutes
-    
     file_paths_list = file_path_string.split(',') if file_path_string else []
     
     files_info = []
@@ -510,30 +184,32 @@ def view_clip(key):
             original_filename = filename_with_key.split('_', 2)[-1] 
             files_info.append({'path': p.strip(), 'name': original_filename})
 
+    # Note: We do not handle create_clip or upload here, only viewing.
 
     return render_template('clipboard.html', 
                            key=key, 
                            content=content, 
                            files_info=files_info,
-                           expiry_info_days=expiry_info_days,
-                           expiry_info_hours=expiry_info_hours,
+                           expiry_info_days=days,
+                           expiry_info_hours=hours,
                            expiry_info_minutes=minutes,
                            server_port=CLIPBOARD_PORT)
 
 
 @app.route('/download/<path:file_path>')
 def download_file(file_path):
+    # Security check for file path
     if not file_path.startswith(UPLOAD_FOLDER + '/'):
          flash('Invalid download request.', 'error')
          return redirect(url_for('index'))
          
+    # Extract key from filename
     filename_part = os.path.basename(file_path)
     try:
         key = filename_part.split('_', 1)[0]
     except IndexError:
         flash('Invalid file path format.', 'error')
         return redirect(url_for('index'))
-
 
     db = get_db()
     cursor = db.cursor()
@@ -546,6 +222,7 @@ def download_file(file_path):
 
     file_paths_string, expires_at_str = clip
     
+    # Check if the requested file_path is actually part of the clip
     if file_path not in [p.strip() for p in file_paths_string.split(',')]:
         flash('File not found in the associated clip.', 'error')
         return redirect(url_for('view_clip', key=key))
@@ -558,6 +235,7 @@ def download_file(file_path):
         return redirect(url_for('index'))
     
     
+    # Use original filename for download name
     filename_with_key = os.path.basename(file_path)
     original_filename = filename_with_key.split('_', 2)[-1] 
     
@@ -566,228 +244,485 @@ def download_file(file_path):
                                as_attachment=True, 
                                download_name=original_filename)
 
-# --- Admin Authentication Routes ---
+if __name__ == '__main__':
+    # This block is not used in Gunicorn mode, but is kept for completeness
+    pass
 
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    ADMIN_PASSWORD_HASH_CHECK = get_admin_password_hash()
-    
-    if request.method == 'POST':
-        password = request.form.get('password')
+PYEOF_WEB_SERVICE
+
+# ============================================
+# 4. Create clipboard_cli.py (The new Admin/Create Tool)
+# ============================================
+print_status "4/6: Creating clipboard_cli.py (New CLI Management Tool)..."
+cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
+import os
+import sqlite3
+import random
+import string
+import re
+import sys
+import argparse
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv, find_dotenv
+
+# --- Configuration & Init ---
+# Attempt to load .env from the expected path
+DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
+UPLOAD_FOLDER = 'uploads'
+EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
+BASE_URL = f"http://YOUR_IP:{os.getenv('CLIPBOARD_PORT', '3214')}" 
+KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
+# MAX_REMOTE_SIZE_BYTES is not used here as remote file download must be managed via web interface or external tools now.
+
+# --- Colors ---
+class Color:
+    PURPLE = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    END = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+# --- Database Management ---
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clips (
+            id INTEGER PRIMARY KEY,
+            key TEXT UNIQUE NOT NULL,
+            content TEXT,
+            file_path TEXT, 
+            created_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def generate_key(length=8):
+    characters = string.ascii_letters + string.digits
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    while True:
+        key = ''.join(random.choice(characters) for i in range(length))
+        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
+        exists = cursor.fetchone()
+        if not exists:
+            conn.close()
+            return key
+
+def cleanup_expired_clips():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+    # Delete files associated with expired clips
+    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
+    expired_files = cursor.fetchall()
+
+    for file_path_tuple in expired_files:
+        file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
+        for file_path in file_paths:
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+            if file_path and os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                except OSError as e:
+                    print(f"[{Color.YELLOW}WARNING{Color.END}] Error removing file {full_path}: {e}")
+            
+    # Delete clips from DB
+    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
+    conn.commit()
+    conn.close()
+
+# --- Main CLI Functions ---
+
+def create_new_clip():
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip ---{Color.END}")
+    content = input("Enter text content (leave empty if only creating a placeholder): ").strip()
+    custom_key = input("Enter custom link key (optional, leave empty for random): ").strip()
+
+    key = None
+    if custom_key:
+        if not re.match(KEY_REGEX, custom_key):
+            print(f"{Color.RED}Error: Custom key is invalid.{Color.END}")
+            return
         
-        if ADMIN_PASSWORD_HASH_CHECK and check_password_hash(ADMIN_PASSWORD_HASH_CHECK, password):
-            session['logged_in'] = True
-            flash('Login successful!', 'success')
-            return redirect(url_for('admin_panel'))
-        else:
-            flash('Invalid password.', 'error')
-            return render_template('login.html', admin_port=CLIPBOARD_PORT)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (custom_key,))
+        if cursor.fetchone():
+            print(f"{Color.RED}Error: Key '{custom_key}' is already taken.{Color.END}")
+            conn.close()
+            return
+        key = custom_key
     
-    # Check if a password hash is even set (for initial setup check)
-    if not ADMIN_PASSWORD_HASH_CHECK:
-        print("CRITICAL: ADMIN_PASSWORD_HASH is missing from .env! Check installation script.")
+    if not key:
+        key = generate_key()
 
-    return render_template('login.html', admin_port=CLIPBOARD_PORT)
+    if not content:
+        content = f"Empty clip created via CLI. Key: {key}"
 
-@app.route('/admin/logout')
-def admin_logout():
-    session.pop('logged_in', None)
-    flash('You have been logged out.', 'success')
-    return redirect(url_for('admin_login'))
+    expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
 
-
-# --- Admin Routes (Same as V18) ---
-
-@app.route('/admin')
-@login_required
-# ... (admin_panel function is unchanged)
-def admin_panel():
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT id, key, content, file_path, created_at, expires_at FROM clips ORDER BY created_at DESC")
-    clips_db = cursor.fetchall()
-    
-    total_size = 0
-    total_files = 0
-    
-    clips = []
-    for clip in clips_db:
-        file_list = []
-        content_safe = clip['content'] if clip['content'] else "No text content"
-        content_preview = content_safe[:50] + ('...' if len(content_safe) > 50 else '')
-
-        if clip['file_path']:
-            file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
-            for file_path in file_paths:
-                 full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
-                 
-                 if os.path.exists(full_path):
-                     try:
-                         total_size += os.path.getsize(full_path)
-                         total_files += 1
-                         file_name = os.path.basename(file_path).split('_', 2)[-1]
-                         file_list.append(file_name)
-                     except:
-                         continue
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (key, content, "", datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+        conn.close()
         
-        clips.append({
-            'id': clip['id'],
-            'key': clip['key'],
-            'content_preview': content_preview,
-            'file_list': file_list,
-            'created_at': clip['created_at'].split(' ')[0],
-            'expires_at': clip['expires_at'].split(' ')[0],
-        })
+        print(f"\n{Color.GREEN}✅ Success! Clip created:{Color.END}")
+        print(f"   {Color.BOLD}Key:{Color.END} {key}")
+        print(f"   {Color.BOLD}Link:{Color.END} {BASE_URL}/{key}")
+        print(f"   {Color.BOLD}Expires:{Color.END} {expires_at.strftime('%Y-%m-%d %H:%M:%S')} (in {EXPIRY_DAYS} days)")
+        
+    except sqlite3.Error as e:
+        print(f"{Color.RED}Database Error: {e}{Color.END}")
+    except Exception as e:
+        print(f"{Color.RED}An unexpected error occurred: {e}{Color.END}")
 
-    total_size_mb = total_size / (1024 * 1024) if total_size > 0 else 0.0
+
+def list_clips():
+    cleanup_expired_clips()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, key, content, file_path, created_at, expires_at FROM clips ORDER BY id DESC")
+    clips = cursor.fetchall()
+    conn.close()
+
+    if not clips:
+        print(f"\n{Color.YELLOW}No active clips found.{Color.END}")
+        return
+
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
+    print(f"{Color.CYAN}{'ID':<4} {'Key':<20} {'Content Preview':<40} {'Files':<10} {'Expires':<10}{Color.END}")
+    print("-" * 90)
     
-    return render_template('admin.html', 
-                           clips=clips, 
-                           total_size_mb=f"{total_size_mb:.2f}", 
-                           total_files=total_files, 
-                           server_port=CLIPBOARD_PORT,
-                           admin_port=CLIPBOARD_PORT)
+    for clip in clips:
+        content_preview = (clip['content'][:35] + '...') if clip['content'] and len(clip['content']) > 35 else (clip['content'] or "No Content")
+        file_count = len([p for p in clip['file_path'].split(',') if p.strip()]) if clip['file_path'] else 0
+        
+        print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<20}{Color.END} {content_preview:<40} {file_count:<10} {clip['expires_at'].split(' ')[0]:<10}")
+    print("-" * 90)
 
 
-@app.route('/admin/delete/<int:clip_id>', methods=['POST'])
-@login_required
-# ... (delete_clip function is unchanged)
-def delete_clip(clip_id):
-    db = get_db()
-    cursor = db.cursor()
+def delete_clip():
+    list_clips()
+    if not input(f"\n{Color.YELLOW}Proceed with deletion? (yes/no): {Color.END}").lower().strip().startswith('y'):
+        print("Deletion cancelled.")
+        return
 
-    cursor.execute("SELECT file_path FROM clips WHERE id = ?", (clip_id,))
+    clip_id_or_key = input("Enter Clip ID or Key to delete: ").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Try to find the clip by ID or Key
+    if clip_id_or_key.isdigit():
+        cursor.execute("SELECT id, key, file_path FROM clips WHERE id = ?", (int(clip_id_or_key),))
+    else:
+        cursor.execute("SELECT id, key, file_path FROM clips WHERE key = ?", (clip_id_or_key,))
+    
     clip = cursor.fetchone()
     
-    if clip and clip['file_path']:
+    if not clip:
+        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
+        conn.close()
+        return
+
+    clip_id = clip['id']
+    clip_key = clip['key']
+    
+    # Delete associated files
+    if clip['file_path']:
         file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
         for file_path in file_paths:
             full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
             if os.path.exists(full_path):
-                try:
-                    os.remove(full_path)
-                    flash(f'File {file_path} successfully deleted.', 'success')
-                except OSError as e:
-                    flash(f'Error deleting file {file_path}: {e}', 'error')
-                    return redirect(url_for('admin_panel'))
-
+                os.remove(full_path)
+                print(f" - Deleted file: {os.path.basename(file_path)}")
+                
+    # Delete from DB
     cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
-    db.commit()
-    flash(f'Clip ID {clip_id} was successfully deleted from database.', 'success')
-    return redirect(url_for('admin_panel'))
+    conn.commit()
+    conn.close()
+    
+    print(f"\n{Color.GREEN}✅ Successfully deleted Clip ID {clip_id} (Key: {clip_key}).{Color.END}")
 
 
-@app.route('/admin/edit_key/<int:clip_id>', methods=['GET', 'POST'])
-@login_required
-# ... (edit_key function is unchanged)
-def edit_key(clip_id):
-    db = get_db()
-    cursor = db.cursor()
+def edit_clip():
+    list_clips()
+    clip_id_or_key = input("\nEnter Clip ID or Key to edit: ").strip()
 
-    cursor.execute("SELECT id, key, file_path, created_at, expires_at FROM clips WHERE id = ?", (clip_id,))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if clip_id_or_key.isdigit():
+        cursor.execute("SELECT id, key, content FROM clips WHERE id = ?", (int(clip_id_or_key),))
+    else:
+        cursor.execute("SELECT id, key, content FROM clips WHERE key = ?", (clip_id_or_key,))
+    
     clip = cursor.fetchone()
     
     if not clip:
-        flash('Clip not found.', 'error')
-        return redirect(url_for('admin_panel'))
+        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
+        conn.close()
+        return
 
-    if request.method == 'POST':
-        new_key = request.form.get('key').strip()
+    clip_id = clip['id']
+    clip_key = clip['key']
+
+    print(f"\n{Color.CYAN}--- Editing Clip ID {clip_id} (Key: {clip_key}) ---{Color.END}")
+    print(f"Current Key: {Color.BOLD}{clip_key}{Color.END}")
+    print("--------------------------------------------------")
+    print(f"1. Edit Key")
+    print(f"2. Edit Content")
+    print(f"0. Cancel")
+    
+    choice = input("Enter choice (1/2/0): ").strip()
+
+    if choice == '1':
+        new_key = input(f"Enter new Key (Current: {clip_key}): ").strip()
+        if not new_key or not re.match(KEY_REGEX, new_key):
+            print(f"{Color.RED}Error: Invalid or empty key.{Color.END}")
+            conn.close()
+            return
         
-        cursor.execute("SELECT key FROM clips WHERE id = ?", (clip_id,))
-        current_key = cursor.fetchone()['key']
-        
-        if new_key != current_key:
-            if not re.match(KEY_REGEX, new_key):
-                flash('New key is invalid.', 'error')
-                return redirect(url_for('edit_key', clip_id=clip_id))
-            
+        if new_key != clip_key:
             cursor.execute("SELECT 1 FROM clips WHERE key = ? AND id != ?", (new_key, clip_id))
             if cursor.fetchone():
-                flash(f'❌ Error: Key **{new_key}** is already taken.', 'error')
-                return redirect(url_for('edit_key', clip_id=clip_id))
+                print(f"{Color.RED}Error: Key '{new_key}' is already taken.{Color.END}")
+                conn.close()
+                return
+        
+        cursor.execute("UPDATE clips SET key = ? WHERE id = ?", (new_key, clip_id))
+        conn.commit()
+        print(f"\n{Color.GREEN}✅ Key updated successfully to: {new_key}{Color.END}")
+        
+    elif choice == '2':
+        print(f"\n{Color.YELLOW}--- Current Content ---{Color.END}")
+        print(clip['content'] if clip['content'] else "(Empty)")
+        print("---------------------------------------")
+        new_content = input("Enter new content (or press Ctrl+D/Ctrl+Z to cancel): ").strip()
+        
+        # Simple multi-line input handling (Note: this is basic)
+        content_lines = []
+        print(f"Type content. Press Ctrl+D/Ctrl+Z, then Enter, to finish.")
+        try:
+            while True:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                content_lines.append(line.rstrip('\n'))
+            new_content = "\n".join(content_lines)
+        except EOFError:
+            new_content = "\n".join(content_lines)
 
-        cursor.execute(
-            "UPDATE clips SET key = ? WHERE id = ?",
-            (new_key, clip_id)
-        )
-        db.commit()
-        flash(f'Key for Clip ID {clip_id} successfully updated to: {new_key}', 'success')
-        return redirect(url_for('admin_panel'))
+        cursor.execute("UPDATE clips SET content = ? WHERE id = ?", (new_content, clip_id))
+        conn.commit()
+        print(f"\n{Color.GREEN}✅ Content updated successfully.{Color.END}")
     
-    file_paths_string = clip['file_path'] if clip['file_path'] else ""
-    file_list = [os.path.basename(p.strip()).split('_', 2)[-1] for p in file_paths_string.split(',') if p.strip()]
+    elif choice == '0':
+        print("Edit cancelled.")
 
-    return render_template('edit_key.html', clip=clip, file_list=file_list, admin_port=CLIPBOARD_PORT)
+    conn.close()
 
-@app.route('/admin/edit_content/<int:clip_id>', methods=['GET', 'POST'])
-@login_required
-# ... (edit_content function is unchanged)
-def edit_content(clip_id):
-    db = get_db()
-    cursor = db.cursor()
-    
-    cursor.execute("SELECT id, key, content, file_path FROM clips WHERE id = ?", (clip_id,))
-    clip = cursor.fetchone()
-    
-    if not clip:
-        flash('Clip not found.', 'error')
-        return redirect(url_for('admin_panel'))
-
-    if request.method == 'POST':
-        new_content = request.form.get('content')
-
-        cursor.execute(
-            "UPDATE clips SET content = ? WHERE id = ?",
-            (new_content, clip_id)
-        )
-        db.commit()
-        flash(f'Content for Clip ID {clip_id} successfully updated.', 'success')
-        return redirect(url_for('admin_panel'))
-    
-    file_paths_string = clip['file_path'] if clip['file_path'] else ""
-    file_list = [os.path.basename(p.strip()).split('_', 2)[-1] for p in file_paths_string.split(',') if p.strip()]
-    
-    return render_template('edit_content.html', clip=clip, file_list=file_list, admin_port=CLIPBOARD_PORT)
-
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    # Check for command line arguments
-    if len(sys.argv) > 1 and sys.argv[1] == 'reset-password':
-        reset_admin_password()
-        sys.exit(0)
-    
-    # Normal Flask/Gunicorn startup
+def main_menu():
     init_db()
-    app.run(host='0.0.0.0', port=CLIPBOARD_PORT, debug=True)
+    cleanup_expired_clips()
 
-PYEOF_APP_MERGED_V20
+    while True:
+        print(f"\n{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
+        print(f"{Color.PURPLE}{Color.BOLD}   Clipboard CLI Manager (Base URL: {BASE_URL}){Color.END}")
+        print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
+        print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text only)")
+        print(f"2. {Color.BLUE}List All Clips{Color.END}")
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key or Content)")
+        print(f"4. {Color.RED}Delete Clip{Color.END}")
+        print("0. Exit")
+        
+        choice = input("Enter your choice: ").strip()
+
+        if choice == '1':
+            create_new_clip()
+        elif choice == '2':
+            list_clips()
+        elif choice == '3':
+            edit_clip()
+        elif choice == '4':
+            delete_clip()
+        elif choice == '0':
+            print(f"\n{Color.BOLD}Exiting CLI Manager. Goodbye!{Color.END}")
+            break
+        else:
+            print(f"{Color.RED}Invalid choice. Please try again.{Color.END}")
+
+if __name__ == '__main__':
+    main_menu()
+
+PYEOF_CLI_TOOL
+
+# ============================================
+# 5. Create Minimal Templates (For web_service.py)
+# ============================================
+print_status "5/6: Creating minimal HTML templates for web view..."
+
+# --- index.html (Just a welcome page) ---
+cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Internet Clipboard Server</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
+        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #007bff; margin-bottom: 20px; }
+        p { font-size: 1.1em; color: #555; }
+        .cli-note { margin-top: 30px; padding: 15px; background-color: #ffeeba; border: 1px solid #ffcc00; border-radius: 8px; color: #856404; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Internet Clipboard Server</h1>
+        <p>This server is running in Light Mode.</p>
+        <div class="cli-note">
+            To create or manage clips (text or files), you must connect to the server via SSH and use the Command Line Interface (CLI) tool:
+            <br>
+            <code>sudo python3 /opt/clipboard_server/clipboard_cli.py</code>
+        </div>
+    </div>
+</body>
+</html>
+INDEXEOF
+
+# --- clipboard.html (Same as before, only for viewing data) ---
+# NOTE: This is the same file as V21, but now it's guaranteed to be created.
+cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clip: {{ key }}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #007bff; text-align: center; margin-bottom: 20px; }
+        pre { background-color: #eee; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; overflow: auto; max-height: 400px; margin-bottom: 20px; border: 1px solid #ccc; position: relative; }
+        .content-section { margin-bottom: 30px; }
+        .files-section { margin-bottom: 30px; border-top: 1px solid #eee; padding-top: 20px; }
+        .files-section h2 { color: #333; font-size: 1.2em; margin-bottom: 15px; }
+        .file-item { display: flex; justify-content: space-between; align-items: center; background-color: #f0f8ff; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px; border-left: 5px solid #007bff; }
+        .file-item a { color: #007bff; text-decoration: none; font-weight: bold; }
+        .file-item a:hover { text-decoration: underline; }
+        .expiry-info { text-align: center; color: #d9534f; font-weight: bold; margin-bottom: 20px; }
+        .back-link { display: block; text-align: center; margin-top: 30px; }
+        .back-link a { color: #007bff; text-decoration: none; font-weight: bold; }
+        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: right; margin-left: 10px; }
+        .copy-button:hover { background-color: #4cae4c; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="flash error">
+            {% for category, message in get_flashed_messages(with_categories=true) %}
+                {% if category == 'error' %}
+                    {{ message }}
+                {% endif %}
+            {% endfor %}
+        </div>
+        
+        {% if clip and content %}
+            <h1>Clip Content for: {{ key }}</h1>
+            
+            <div class="expiry-info">
+                Expires in: {{ expiry_info_days }} days, {{ expiry_info_hours }} hours, and {{ expiry_info_minutes }} minutes.
+            </div>
+
+            <div class="content-section">
+                <h2>Text Content</h2>
+                <button class="copy-button" onclick="copyContent()">Copy Text</button>
+                <pre id="text-content">{{ content }}</pre>
+            </div>
+        {% elif expired %}
+            <h1>Clip Not Found</h1>
+            <div class="expiry-info">This clipboard link has expired and its content has been deleted.</div>
+        {% else %}
+             <h1>Clip Not Found</h1>
+             <div class="expiry-info">The clip with key **{{ key }}** does not exist.</div>
+        {% endif %}
+        
+        {% if files_info %}
+            <div class="files-section">
+                <h2>Attached Files ({{ files_info|length }})</h2>
+                {% for file in files_info %}
+                    <div class="file-item">
+                        <span>{{ file.name }}</span>
+                        <a href="{{ url_for('download_file', file_path=file.path) }}">Download</a>
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+
+        <div class="back-link">
+            <a href="/">← Go to Home</a>
+        </div>
+    </div>
+
+    <script>
+        function copyContent() {
+            const content = document.getElementById('text-content').innerText;
+            navigator.clipboard.writeText(content).then(() => {
+                alert('Text copied to clipboard!');
+            }).catch(err => {
+                console.error('Could not copy text: ', err);
+            });
+        }
+    </script>
+</body>
+</html>
+CLIPBOARDEOF
+
+# Note: We skip login.html, admin.html, edit_key.html, edit_content.html as they are no longer needed.
 
 
 # ============================================
-# 5. Create Templates (No change needed from V18)
+# 6. Create Systemd Service (Single Service for Web View)
 # ============================================
-print_status "5/7: Templates are already up-to-date (V18 files are sufficient)..."
-# (Skipping template recreation)
+print_status "6/6: Creating Systemd service for light web view..."
 
-# ============================================
-# 6. Create Systemd Service (Single Service)
-# ============================================
-print_status "6/7: Creating single Systemd service (clipboard.service)..."
-
-# --- clipboard.service (Port 3214 - Runs app.py) ---
+# --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Service (Port ${CLIPBOARD_PORT})
+Description=Flask Clipboard Web Viewer (Light Mode)
 After=network.target
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# Pass the full .env path as an environment variable to ensure app.py can find it
-ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} app:app
+# ExecStart now runs the minimal web_service.py
+ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
 TimeoutSec=30
@@ -801,11 +736,9 @@ SERVICEEOF
 # 7. Final Steps
 # ============================================
 print_status "7/7: Initializing Database and starting service..."
-systemctl is-active --quiet admin.service && systemctl stop admin.service || true
-systemctl is-enabled --quiet admin.service && systemctl disable admin.service || true
 
 # Initialize DB using the venv Python
-"$PYTHON_VENV_PATH" -c "from app import init_db; init_db()"
+"$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py"
 
 systemctl daemon-reload
 systemctl enable clipboard.service
@@ -813,15 +746,14 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V20 - Final Fix)"
+echo "🎉 Installation Complete (Clipboard Server V22 - CLI/Light Mode)"
 echo "================================================"
-echo "✅ CLIPBOARD & ADMIN STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
+echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
-echo "🌐 CLIPBOARD URL: http://YOUR_IP:${CLIPBOARD_PORT}"
-echo "🔒 ADMIN PANEL URL: http://YOUR_IP:${CLIPBOARD_PORT}/admin/login"
+echo "🌐 CLIPBOARD URL (View Only): http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "🚨 FORGOT PASSWORD? Run this command on the server:"
-echo "   ${YELLOW}sudo ${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/app.py reset-password${NC}"
+echo "💻 ADMIN/CREATION: Use the Command Line Interface (CLI)!"
+echo -e "   ${BLUE}sudo ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py${NC}"
 echo "------------------------------------------------"
 echo "Status:   sudo systemctl status clipboard.service"
 echo "Restart:  sudo systemctl restart clipboard.service"
