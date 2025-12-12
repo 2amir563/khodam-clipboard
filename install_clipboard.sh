@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V15 - FINAL: Separate Admin Port (3215) with Password Protection.
+# V16 - FINAL: Separate Admin Port (3215) with Password Prompt on Server.
 
 set -e
 
@@ -10,10 +10,6 @@ CLIPBOARD_PORT="3214"
 ADMIN_PORT="3215" 
 EXPIRY_DAYS="30"
 SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) 
-
-# 🛑 1. SET YOUR ADMIN PASSWORD HERE (Required for V15)
-ADMIN_PASSWORD="123456789" # <--- MUST BE CHANGED!
-# 🛑 ----------------------------------------------------
 
 # Colors
 GREEN='\033[0;32m'
@@ -29,26 +25,47 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$ADMIN_PASSWORD" = "YOUR_SECURE_PASSWORD_HERE" ]; then
-    print_error "❌ Please edit the install script and set a strong password for ADMIN_PASSWORD."
+echo "=================================================="
+echo "📋 Internet Clipboard Server Installer (V16 - Separate Admin Port & Password)"
+echo "=================================================="
+
+# ============================================
+# 1. Password Input Phase
+# ============================================
+echo ""
+echo "🛑 SECURITY SETUP: Admin Panel Password"
+echo "------------------------------------------------"
+
+read -s -p "Enter a strong Admin Password for Port ${ADMIN_PORT}: " ADMIN_PASSWORD
+echo ""
+read -s -p "Confirm Admin Password: " ADMIN_PASSWORD_CONFIRM
+echo ""
+
+if [ -z "$ADMIN_PASSWORD" ]; then
+    print_error "❌ Password cannot be empty."
     exit 1
 fi
 
-echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V15 - Separate Admin Port & Password)"
-echo "=================================================="
+if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+    print_error "❌ Passwords do not match. Installation aborted."
+    exit 1
+fi
 
+echo "------------------------------------------------"
+print_status "Password successfully set."
+echo ""
 
 # ============================================
-# 1. System Setup & Venv
+# 2. System Setup & Venv
 # ============================================
-print_status "1/7: Ensuring system setup and Virtual Environment..."
+print_status "2/8: Ensuring system setup and Virtual Environment..."
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
 
+# Install dependencies needed for password hashing (werkzeug)
 python3 -m venv venv || true 
 source venv/bin/activate || true
 
@@ -60,22 +77,22 @@ Flask
 python-dotenv
 gunicorn
 requests
-werkzeug # For password hashing
+werkzeug
 REQEOF
 pip install -r requirements.txt || true
 deactivate
 
 # ============================================
-# 2. Update .env and Directories
+# 3. Update .env and Directories
 # ============================================
-print_status "2/7: Updating configuration and ensuring directory structure..."
+print_status "3/8: Updating configuration and ensuring directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
 chmod 777 "$INSTALL_DIR/uploads" 
 
 # Hash the password for secure storage
-ADMIN_PASSWORD_HASH=$(python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('$ADMIN_PASSWORD'))")
+ADMIN_PASSWORD_HASH=$(echo "$ADMIN_PASSWORD" | $PYTHON_VENV_PATH -c "from werkzeug.security import generate_password_hash; import sys; print(generate_password_hash(sys.stdin.read().strip()))")
 
 # --- Create .env file ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
@@ -88,9 +105,9 @@ ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 ENVEOF
 
 # ============================================
-# 3. Create app.py (Primary Service: 3214)
+# 4. Create app.py (Primary Service: 3214)
 # ============================================
-print_status "3/7: Creating app.py (Primary service)..."
+print_status "4/8: Creating app.py (Primary service)..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP'
 import os
 import sqlite3
@@ -116,7 +133,7 @@ CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214'))
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
 
-# --- Database Management ---
+# --- Database Management (Common) ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
@@ -146,7 +163,7 @@ def init_db():
         """)
         db.commit()
 
-# --- Helper Functions (copied from V14) ---
+# --- Helper Functions (Common) ---
 def generate_key(length=8):
     characters = string.ascii_letters + string.digits
     db = get_db()
@@ -190,7 +207,6 @@ def download_remote_file(url, key_prefix, index):
             if content_length and int(content_length) > MAX_REMOTE_SIZE_BYTES:
                 return "File size exceeds limit."
             
-            # Try to get filename from headers
             filename = f"file_{index}"
             if 'Content-Disposition' in r.headers:
                 filename_header = r.headers['Content-Disposition']
@@ -198,7 +214,6 @@ def download_remote_file(url, key_prefix, index):
                 if match:
                     filename = match.group(1)
             
-            # Fallback to URL path
             if filename == f"file_{index}":
                 path = urllib.parse.urlparse(url).path
                 filename = os.path.basename(path)
@@ -262,7 +277,6 @@ def index():
 
 @app.route('/create', methods=['POST'])
 def create_clip():
-    # --- Simplified Create Clip Logic (V14) ---
     content = request.form.get('content')
     uploaded_file = request.files.get('file')
     remote_urls_input = request.form.get('remote_urls', '').strip()
@@ -409,7 +423,7 @@ def view_clip(key):
                            files_info=files_info,
                            expiry_info_days=expiry_info_days,
                            expiry_info_hours=expiry_info_hours,
-                           expiry_info_minutes=expiry_info_minutes,
+                           expiry_info_minutes=minutes,
                            server_port=CLIPBOARD_PORT)
 
 
@@ -464,9 +478,9 @@ if __name__ == '__main__':
 PYEOF_APP
 
 # ============================================
-# 4. Create admin.py (Admin Service: 3215)
+# 5. Create admin.py (Admin Service: 3215)
 # ============================================
-print_status "4/7: Creating admin.py (Admin service with password protection)..."
+print_status "5/8: Creating admin.py (Admin service with password protection)..."
 cat > "$INSTALL_DIR/admin.py" << 'PYEOF_ADMIN'
 import os
 import sqlite3
@@ -510,7 +524,7 @@ def login_required(f):
             return redirect(url_for('admin_login'))
         return f(*args, **kwargs)
     wrap.__name__ = f.__name__
-    return wrap
+    return login_required(wrap)
 
 # --- Admin Authentication Routes ---
 
@@ -691,11 +705,71 @@ PYEOF_ADMIN
 
 
 # ============================================
-# 5. Create Templates (Adding Login Page)
+# 6. Create Templates (HTML files are the same as V15)
 # ============================================
-print_status "5/7: Creating/Updating Templates (Adding Login Page)..."
+print_status "6/8: Creating/Updating HTML Templates..."
 
-# --- login.html --- (New)
+# --- index.html ---
+cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>Share text, a local file, or remote file URLs between devices.</p>
+{% if flashed_messages %}
+<ul style="list-style: none; padding: 0;">
+{% for category, message in flashed_messages %}
+    <li class="flash-{{ category }}">{{ message | safe }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data">
+    <textarea name="content" rows="6" placeholder="Your content/text here">{{ old_data.get('content', '') }}</textarea>
+    <p>— OR —</p>
+    
+    <div style="text-align: left; margin-bottom: 15px;">
+        <label for="file">Upload Single Local File (Max 1 file):</label>
+        <input type="file" name="file" id="file" style="width: 100%; margin-top: 5px;"> 
+    </div>
+
+    <p>— OR —</p>
+
+    <div style="text-align: left; margin-bottom: 15px;">
+        <label for="remote_urls">Multiple Remote File URLs (one URL per line, will be downloaded to server):</label>
+        <textarea name="remote_urls" id="remote_urls" rows="4" placeholder="e.g.,
+https://example.com/file1.zip
+https://another.com/image.jpg
+">{{ old_data.get('remote_urls', '') }}</textarea>
+    </div>
+
+    <hr style="border: 1px dashed #ccc; margin: 15px 0;">
+    
+    <input type="text" name="custom_key" placeholder="Custom Key (Optional, e.g., MyProjectKey)" value="{{ old_data.get('custom_key', '') }}" pattern="^[a-zA-Z0-9_-]{3,64}$" title="Custom key must be 3-64 characters long and contain only letters, numbers, hyphen, or underscore.">
+    <input type="submit" value="Create Link">
+    <p style="font-size: 0.8em; color: #777;">If the custom key is empty, a random key will be generated.</p>
+</form>
+<p>Content/file will be automatically deleted after **{{ EXPIRY_DAYS }} days**.</p></div></body></html>
+HTM_INDEX
+
+# --- clipboard.html ---
+cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }
+.file-list { list-style: none; padding: 0; }
+.file-list li { margin-bottom: 8px; }
+</style></head><body><div class="container"><h2>Clipboard: {{ key }}</h2>
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}
+<ul style="list-style: none; padding: 0;">
+{% for category, message in messages %}
+    {% if category != 'form_data' %}
+        <li class="flash-{{ category }}">{{ message | safe }}</li>
+    {% endif %}
+{% endfor %}
+</ul>
+{% endif %}
+{% endwith %}
+{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
+    **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">Create New Clip</a></p>
+{% endif %}</div></body></html>
+HTM_CLIPBOARD
+
+# --- login.html ---
 cat > "$INSTALL_DIR/templates/login.html" << 'HTM_LOGIN'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Login</title><style>
     body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
@@ -736,7 +810,7 @@ cat > "$INSTALL_DIR/templates/login.html" << 'HTM_LOGIN'
 </html>
 HTM_LOGIN
 
-# --- admin.html --- (Updated for logout)
+# --- admin.html ---
 cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN_GRAPHICAL'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title><style>
     /* Global Styles */
@@ -875,14 +949,110 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN_GRAPHICAL'
 </html>
 HTM_ADMIN_GRAPHICAL
 
-# --- index.html, clipboard.html, edit_key.html, edit_content.html (No Change needed, uses relative paths or old ports)
-# We reuse V14 templates for these, ensuring admin related links point to the correct port (3215) where applicable in admin.py.
-# The previous version's templates are already correct for the primary service.
+# --- edit_key.html ---
+cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY_GRAPHICAL'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Key</title><style>
+    body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
+    .container { background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); max-width: 500px; margin: 0 auto; }
+    h2 { color: #ffc107; margin-bottom: 20px; }
+    input[type="text"] { width: 95%; padding: 12px; margin-bottom: 20px; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; font-size: 1em; }
+    input[type="submit"] { background-color: #ffc107; color: #333; padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.3s; }
+    input[type="submit"]:hover { background-color: #e0a800; }
+    .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 15px; border-radius: 5px; text-align: left; }
+    .info { background-color: #e9f7fe; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: left; border-left: 5px solid #007bff; }
+    .info p { margin: 5px 0; }
+    span.file { background-color: #17a2b8; color: white; padding: 4px 8px; border-radius: 5px; font-size: 0.8em; font-weight: 500; margin-right: 5px; display: inline-block; margin-top: 5px;}
+    .back-link { display: block; margin-top: 20px; color: #007bff; text-decoration: none; font-weight: bold; }
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" integrity="sha512-Fo3rlrZj/k7ujTnHg4C0UjCg6lK3T0B3l/4P7Q+E3pL6D7I2w7Jk1+xQ+K/7ZJ/5Y7c2P0G6Q5eR5jQ7zQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+</head>
+<body>
+<div class="container">
+    <h2><i class="fas fa-key"></i> Edit Clip Key (ID: {{ clip['id'] }})</h2>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <ul style="list-style: none; padding: 0;">
+    {% for category, message in messages %}
+        {% if category != 'form_data' %}
+            <li class="flash-{{ category }}">{{ message | safe }}</li>
+        {% endif }
+    {% endfor %}
+    </ul>
+    {% endif %}
+    {% endwith %}
+
+    <div class="info">
+        <p><i class="fas fa-link"></i> <b>Current Key:</b> {{ clip['key'] }}</p>
+        <p><i class="fas fa-calendar-times"></i> <b>Expires:</b> {{ clip['expires_at'].split(' ')[0] }}</p>
+        <p><i class="fas fa-file-alt"></i> <b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %}{% else %}N/A{% endif %}</p>
+    </div>
+
+    <form method="POST" action="{{ url_for('edit_key', clip_id=clip['id']) }}">
+        <label for="key" style="display: block; text-align: left; margin-bottom: 5px; font-weight: bold;">New Key/Address:</label>
+        <input type="text" name="key" value="{{ clip['key'] }}" pattern="^[a-zA-Z0-9_-]{3,64}$" title="Must be 3-64 characters (letters, numbers, hyphen, underscore)." required>
+        
+        <input type="submit" value="Update Key">
+    </form>
+    <a href="{{ url_for('admin_panel') }}" class="back-link">← Return to Admin Panel</a>
+</div>
+</body>
+</html>
+HTM_EDIT_KEY_GRAPHICAL
+
+# --- edit_content.html ---
+cat > "$INSTALL_DIR/templates/edit_content.html" << 'HTM_EDIT_CONTENT_GRAPHICAL'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Content</title><style>
+    body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
+    .container { background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }
+    h2 { color: #17a2b8; margin-bottom: 20px; }
+    textarea { width: 95%; padding: 12px; margin-bottom: 20px; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; font-size: 1em; }
+    input[type="submit"] { background-color: #17a2b8; color: white; padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.3s; }
+    input[type="submit"]:hover { background-color: #138496; }
+    .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 15px; border-radius: 5px; text-align: left; }
+    .info { background-color: #e9f7fe; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: left; border-left: 5px solid #007bff; }
+    .info p { margin: 5px 0; }
+    span.file { background-color: #17a2b8; color: white; padding: 4px 8px; border-radius: 5px; font-size: 0.8em; font-weight: 500; margin-right: 5px; display: inline-block; margin-top: 5px;}
+    .back-link { display: block; margin-top: 20px; color: #007bff; text-decoration: none; font-weight: bold; }
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" integrity="sha512-Fo3rlrZj/k7ujTnHg4C0UjCg6lK3T0B3l/4P7Q+E3pL6D7I2w7Jk1+xQ+K/7ZJ/5Y7c2P0G6Q5eR5jQ7zQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+</head>
+<body>
+<div class="container">
+    <h2><i class="fas fa-edit"></i> Edit Clip Content (ID: {{ clip['id'] }})</h2>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <ul style="list-style: none; padding: 0;">
+    {% for category, message in messages %}
+        {% if category != 'form_data' %}
+            <li class="flash-{{ category }}">{{ message | safe }}</li>
+        {% endif %}
+    {% endfor %}
+    </ul>
+    {% endif %}
+    {% endwith %}
+    
+    <div class="info">
+        <p><i class="fas fa-link"></i> <b>Key:</b> {{ clip['key'] }}</p>
+        <p><i class="fas fa-file-alt"></i> <b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %}{% else %}N/A{% endif %}</p>
+    </div>
+
+    <form method="POST" action="{{ url_for('edit_content', clip_id=clip['id']) }}">
+        <label for="content" style="display: block; text-align: left; margin-bottom: 5px; font-weight: bold;">Text Content:</label>
+        <textarea name="content" rows="10" placeholder="Your text content">{{ clip['content'] }}</textarea>
+        
+        <input type="submit" value="Update Content">
+    </form>
+    <a href="{{ url_for('admin_panel') }}" class="back-link">← Return to Admin Panel</a>
+</div>
+</body>
+</html>
+HTM_EDIT_CONTENT_GRAPHICAL
+
 
 # ============================================
-# 6. Create Systemd Services (Two Separate Services)
+# 7. Create Systemd Services (Two Separate Services)
 # ============================================
-print_status "6/7: Creating two separate Systemd services (clipboard.service and admin.service)..."
+print_status "7/8: Creating two separate Systemd services (clipboard.service and admin.service)..."
 
 # --- clipboard.service (Port 3214) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -922,16 +1092,17 @@ SERVICEEOF
 
 
 # ============================================
-# 7. Final Steps
+# 8. Final Steps
 # ============================================
-print_status "7/7: Initializing Database and starting services..."
+print_status "8/8: Initializing Database and starting services..."
+# We must use the venv python to initialize the DB, which the install script has already sourced/setup.
 $PYTHON_VENV_PATH -c "from app import init_db; init_db()"
 
 systemctl daemon-reload
 systemctl enable clipboard.service
 systemctl enable admin.service
 
-# Stop previous service if running under old name
+# Stop and disable old service names if they exist
 systemctl is-active --quiet clipboard.service.old && systemctl stop clipboard.service.old || true
 systemctl is-enabled --quiet clipboard.service.old && systemctl disable clipboard.service.old || true
 
@@ -940,14 +1111,14 @@ systemctl restart admin.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V15)"
+echo "🎉 Installation Complete (Clipboard Server V16)"
 echo "================================================"
 echo "✅ CLIPBOARD STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "✅ ADMIN STATUS (Port ${ADMIN_PORT}): $(systemctl is-active admin.service)"
 echo "------------------------------------------------"
 echo "🌐 CLIPBOARD URL: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "🔒 ADMIN PANEL URL: http://YOUR_IP:${ADMIN_PORT}/admin"
-echo "🔑 ADMIN PASSWORD: ${ADMIN_PASSWORD}"
+echo "⚠️  Remember the password you entered during installation."
 echo "------------------------------------------------"
 echo "Status:   sudo systemctl status clipboard.service admin.service"
 echo "Restart:  sudo systemctl restart clipboard.service admin.service"
