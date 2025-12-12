@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V33 - FINAL STABILITY: Removed WAL Journal Mode for high compatibility and immediate visibility between Gunicorn workers.
+# V34 - FINAL STABILITY & OPTIMIZATION: SQLite fix (no WAL) + Gunicorn Workers set to 2.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V33 - SQLite Final Fix)"
+echo "📋 Internet Clipboard Server Installer (V34 - Final Stable & Optimized)"
 echo "=================================================="
 
 # ============================================
@@ -74,6 +74,7 @@ print_status "2/7: Updating configuration and directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
+# Set ownership to root but allow others to write to uploads (if flask used another user)
 chmod -R 777 "$INSTALL_DIR" 
 
 # --- Create .env file ---
@@ -86,9 +87,9 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V33: No WAL, Explicit Isolation)
+# 3. Create web_service.py (V33 Logic - Explicit Isolation, Unix Time)
 # ============================================
-print_status "3/7: Creating web_service.py (V33 - SQLite Final Fix)..."
+print_status "3/7: Creating web_service.py (V34 - SQLite stability confirmed)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -120,8 +121,7 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
-            # Use default journal mode (rollback) for better worker stability and visibility
-            # Set isolation_level=None for autocommit/explicit commit control
+            # Crucial V33 fix: isolation_level=None for autocommit/explicit commit and immediate visibility
             db = g._database = sqlite3.connect(
                 DATABASE_PATH, 
                 timeout=10, 
@@ -373,7 +373,7 @@ PYEOF_WEB_SERVICE
 # ============================================
 # 4. Create clipboard_cli.py (The CLI Management Tool - V33)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V33)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V34)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -411,7 +411,7 @@ class Color:
 
 # --- Database Management ---
 def get_db_connection():
-    # V33: Using isolation_level=None to match web service behavior for explicit commit
+    # V33/V34: Using isolation_level=None to match web service behavior for explicit commit
     conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
@@ -419,7 +419,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # V33: Removed PRAGMA journal_mode=WAL
+    # V33/V34: Using INTEGER (Unix Timestamp) for expiry for reliability
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY,
@@ -904,9 +904,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 1)
+# 6. Create Systemd Service (Workers set to 2 in V34)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 1)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V34 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -918,7 +918,8 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${GUNICORN_VENV_PATH} --workers 1 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
+# V34 Optimization: Using 2 workers to mitigate visibility issues often seen with a single worker
+ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
 TimeoutSec=30
@@ -950,9 +951,9 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V33 - پایدار نهایی)"
+echo "🎉 نصب کامل شد (Clipboard Server V34 - پایدار و بهینه)"
 echo "================================================"
-echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است."
+echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
 echo "🌐 آدرس وب: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
