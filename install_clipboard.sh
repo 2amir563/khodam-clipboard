@@ -12,7 +12,7 @@ EXPIRY_DAYS="30"
 SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) 
 
 # 🛑 1. SET YOUR ADMIN PASSWORD HERE (Required for V15)
-ADMIN_PASSWORD="YOUR_SECURE_PASSWORD_HERE" # <--- MUST BE CHANGED!
+ADMIN_PASSWORD="123456789" # <--- MUST BE CHANGED!
 # 🛑 ----------------------------------------------------
 
 # Colors
