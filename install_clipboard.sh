@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V12 - Final: FIX 500 Error in Admin Panel & Final UI Localization.
+# V13 - Final: Robust Admin Panel Fix, Single Local File Policy Enforced.
 
 set -e
 
@@ -25,7 +25,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V12 - Admin Fix & UI Finalization)"
+echo "📋 Internet Clipboard Server Installer (V13 - Admin Fix & Single File Enforced)"
 echo "=================================================="
 
 
@@ -72,9 +72,9 @@ MAX_REMOTE_SIZE_MB=50
 ENVEOF
 
 # ============================================
-# 3. Create app.py (V12 - Admin Fix)
+# 3. Create app.py (V13 - Admin Fix)
 # ============================================
-print_status "3/6: Creating app.py (V12 - Admin Fix)..."
+print_status "3/6: Creating app.py (V13 - Admin Fix)..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF'
 import os
 import sqlite3
@@ -297,14 +297,17 @@ def create_clip():
     # 2. Handle single local file upload
     if uploaded_file and uploaded_file.filename:
         filename = uploaded_file.filename
-        # Local files will use index 99 to distinguish them from remote files (which use 0, 1, 2...)
-        file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_99_{filename}")
+        file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_0_{filename}") # Use index 0 for the single local file
         file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
         uploaded_file.save(file_path_absolute)
         file_paths_list.append(file_path_relative)
     
     # 3. Handle multiple remote URLs
     remote_urls = [url.strip() for url in remote_urls_input.split('\n') if url.strip()]
+    
+    # Start remote file indexing after the local file (if present)
+    remote_index_start = 1 if uploaded_file and uploaded_file.filename else 0
+    
     if remote_urls:
         downloaded_count = 0
         for i, url in enumerate(remote_urls):
@@ -312,7 +315,9 @@ def create_clip():
                 error_messages.append(f'error:Remote URL #{i+1} is not valid (must start with http:// or https://): {url[:50]}...')
                 continue
             
-            download_result = download_remote_file(url, key, i)
+            # Use unique index for remote files
+            download_index = remote_index_start + i
+            download_result = download_remote_file(url, key, download_index)
             
             if download_result.startswith("Error") or download_result.startswith("File size"):
                 error_messages.append(f'error:❌ File Download Error for URL #{i+1}: {download_result}')
@@ -459,42 +464,46 @@ def download_file(file_path):
 def admin_panel():
     db = get_db()
     cursor = db.cursor()
-    # Fetch all clip data including file_path string
     cursor.execute("SELECT id, key, content, file_path, created_at, expires_at FROM clips ORDER BY created_at DESC")
     clips_db = cursor.fetchall()
     
-    # --- File/Size Calculation (Corrected) ---
+    # --- File/Size Calculation (Robust implementation) ---
     total_size = 0
     total_files = 0
     
     clips = []
     for clip in clips_db:
         file_list = []
+        # Ensure content is not None before attempting to slice it
+        content_safe = clip['content'] if clip['content'] else "No text content"
+        content_preview = content_safe[:50] + ('...' if len(content_safe) > 50 else '')
+
         if clip['file_path']:
-            # Split the file_path string into individual file paths
             file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
             for file_path in file_paths:
                  full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
                  
-                 # Check if the file still exists on disk and calculate size/count
                  if os.path.exists(full_path):
-                     total_size += os.path.getsize(full_path)
-                     total_files += 1
-                     # Extract clean filename for display (excluding key_prefix and index)
-                     file_name = os.path.basename(file_path).split('_', 2)[-1]
-                     file_list.append(file_name)
+                     try:
+                         total_size += os.path.getsize(full_path)
+                         total_files += 1
+                         file_name = os.path.basename(file_path).split('_', 2)[-1]
+                         file_list.append(file_name)
+                     except:
+                         # Skip if size cannot be calculated for any reason
+                         continue
         
         # --- Prepare clip dictionary for template ---
         clips.append({
             'id': clip['id'],
             'key': clip['key'],
-            'content_preview': clip['content'][:50] + ('...' if len(clip['content']) > 50 else ''), # Ensure content preview is based on full content
+            'content_preview': content_preview,
             'file_list': file_list,
             'created_at': clip['created_at'].split(' ')[0],
             'expires_at': clip['expires_at'].split(' ')[0],
         })
 
-    total_size_mb = total_size / (1024 * 1024) 
+    total_size_mb = total_size / (1024 * 1024) if total_size > 0 else 0.0
     
     return render_template('admin.html', clips=clips, total_size_mb=f"{total_size_mb:.2f}", total_files=total_files, server_port=PORT)
 
@@ -604,9 +613,9 @@ if __name__ == '__main__':
 PYEOF
 
 # ============================================
-# 4. Create index.html (Fully English)
+# 4. Create index.html (Enforced Single File)
 # ============================================
-print_status "4/6: Creating index.html (Fully English)..."
+print_status "4/6: Creating index.html (Enforced Single File)..."
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>Share text, a local file, or remote file URLs between devices.</p>
 {% if flashed_messages %}
@@ -621,8 +630,8 @@ cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
     <p>— OR —</p>
     
     <div style="text-align: left; margin-bottom: 15px;">
-        <label for="file">Upload Single Local File:</label>
-        <input type="file" name="file" id="file" style="width: 100%; margin-top: 5px;">
+        <label for="file">Upload Single Local File (Max 1 file):</label>
+        <input type="file" name="file" id="file" style="width: 100%; margin-top: 5px;"> 
     </div>
 
     <p>— OR —</p>
@@ -645,9 +654,9 @@ https://another.com/image.jpg
 HTM_INDEX
 
 # ============================================
-# 5. Create clipboard.html (Fully English)
+# 5. Create clipboard.html (No Change)
 # ============================================
-print_status "5/6: Creating clipboard.html (Fully English)..."
+print_status "5/6: Creating clipboard.html (No Change)..."
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }
 .file-list { list-style: none; padding: 0; }
@@ -664,15 +673,15 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
 </ul>
 {% endif %}
 {% endwith %}
-{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
+{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
     **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">Create New Clip</a></p>
 {% endif %}</div></body></html>
 HTM_CLIPBOARD
 
 # ============================================
-# 6. Create Admin Templates (admin.html, edit_key.html, edit_content.html)
+# 6. Create Admin Templates (No Change, already tabular/English)
 # ============================================
-print_status "6/6: Creating admin templates (Final Check)..."
+print_status "6/6: Creating admin templates (No Change)..."
 
 # --- admin.html ---
 cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
@@ -788,7 +797,7 @@ cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY'
     <div class="info">
         <p><b>Current Key:</b> {{ clip['key'] }}</p>
         <p><b>Expires:</b> {{ clip['expires_at'].split(' ')[0] }}</p>
-        <p><b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %}{% else %}N/A{% endif %}</p>
+        <p><b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %{% else %}N/A{% endif %}</p>
     </div>
 
     <form method="POST" action="{{ url_for('edit_key', clip_id=clip['id']) }}">
@@ -870,7 +879,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V12)"
+echo "🎉 Installation Complete (Clipboard Server V13)"
 echo "================================================"
 echo "✅ Service Status: $(systemctl is-active clipboard.service)"
 echo "🌐 Your server is running on port $PORT."
