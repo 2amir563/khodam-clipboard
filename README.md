@@ -7,6 +7,23 @@
 curl -o install_clipboard.sh https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_clipboard.sh && chmod +x install_clipboard.sh && sudo ./install_clipboard.sh
 ```
 
+
+✅ WEB SERVICE STATUS (Port 3214): active
+------------------------------------------------
+🌐 CLIPBOARD URL (View Only): http://YOUR_IP:3214
+------------------------------------------------
+💻 ADMIN/CREATION: Use the Command Line Interface (CLI)!
+   
+```
+sudo /opt/clipboard_server/venv/bin/python3 /opt/clipboard_server/clipboard_cli.py
+```
+
+------------------------------------------------
+Status:   sudo systemctl status clipboard.service
+Logs:     sudo journalctl -u clipboard.service -f
+================================================
+
+
 متوجه شدم. اگر حتی با نسخه V21 (که تمامی اشکالات مربوط به Flask و Template را حل می‌کرد) همچنان خطای Internal Server Error را در سرور خام دریافت می‌کنید، این نشان می‌دهد که ما باید کل ساختار را تغییر دهیم و اپلیکیشن Flask/Gunicorn را کنار بگذاریم.
 
 خواسته‌های شما کاملاً واضح است:
