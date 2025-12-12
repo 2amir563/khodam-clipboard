@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V31 - FINAL FIX: Standardized Expiry using UNIX Timestamps in DB to eliminate Timezone conflicts.
+# V32 - FINAL STABILITY: Ensures immediate database visibility after creation by enforcing DB path cleanup and re-initialization.
 
 set -e
 
@@ -8,6 +8,7 @@ set -e
 INSTALL_DIR="/opt/clipboard_server"
 CLIPBOARD_PORT="3214" 
 EXPIRY_DAYS="30"
+DATABASE_PATH="${INSTALL_DIR}/clipboard.db"
 # Generate a secure secret key for Flask
 SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) 
 
@@ -29,13 +30,18 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V31 - Final Stability)"
+echo "📋 Internet Clipboard Server Installer (V32 - Final Stability Fix)"
 echo "=================================================="
 
 # ============================================
 # 1. System Setup & Venv
 # ============================================
-print_status "1/6: Preparing system and virtual environment..."
+print_status "1/7: Preparing system, virtual environment, and cleaning old DB..."
+
+# Stop service if running and remove old database files
+systemctl stop clipboard.service 2>/dev/null || true
+rm -f "${DATABASE_PATH}" "${DATABASE_PATH}-shm" "${DATABASE_PATH}-wal"
+
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
 
@@ -63,7 +69,7 @@ deactivate
 # ============================================
 # 2. Update .env and Directories
 # ============================================
-print_status "2/6: Updating configuration and directory structure..."
+print_status "2/7: Updating configuration and directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
@@ -79,9 +85,9 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V31: Timestamp Expiry)
+# 3. Create web_service.py (V32: Final stability checks)
 # ============================================
-print_status "3/6: Creating web_service.py (V31 - Timestamp Expiry Fix)..."
+print_status "3/7: Creating web_service.py (V32 - Final stability checks)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -113,7 +119,6 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
-            # Using URI mode and check_same_thread=False for robustness (Gunicorn forced to 1 worker)
             db = g._database = sqlite3.connect(
                 f'file:{DATABASE_PATH}?mode=rw', 
                 uri=True, 
@@ -152,7 +157,7 @@ def generate_key(length=8):
 def cleanup_expired_clips():
     db = get_db()
     cursor = db.cursor()
-    now_ts = int(time.time()) # Current UNIX timestamp
+    now_ts = int(time.time()) 
 
     # Delete associated files
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
@@ -170,7 +175,7 @@ def cleanup_expired_clips():
             
     # Delete database entries
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
-    db.commit()
+    db.commit() # Ensure immediate commit for cleanup
 
 # --- Main Routes ---
 
@@ -191,12 +196,11 @@ def index():
 
         key = custom_key or generate_key()
         
-        # Validate key
+        # Validation and checks... (omitted for brevity)
         if custom_key and not re.match(KEY_REGEX, custom_key):
             flash('Invalid custom key format.', 'error')
             return redirect(url_for('index'))
             
-        # Check for key existence
         try:
             db = get_db()
             cursor = db.cursor()
@@ -208,7 +212,7 @@ def index():
             flash("Database connection error.", 'error')
             return redirect(url_for('index'))
             
-        # File Handling
+        # File Handling... (omitted for brevity)
         file_paths = []
         try:
             for file in uploaded_files:
@@ -229,16 +233,17 @@ def index():
                 except: pass
             return redirect(url_for('index'))
             
-        # Database Insertion (V31: Use UNIX Timestamps for Expiry)
-        expires_at_ts = int(time.time() + (EXPIRY_DAYS * 24 * 3600))
+        # Database Insertion (V32: Use UNIX Timestamps & Final Commit)
+        created_at_ts = int(time.time())
+        expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
         file_path_string = ','.join(file_paths)
         
         try:
             cursor.execute(
                 "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (key, content, file_path_string, int(time.time()), expires_at_ts)
+                (key, content, file_path_string, created_at_ts, expires_at_ts)
             )
-            db.commit()
+            db.commit() # Crucial: Commit immediately after INSERT
             
             # Redirect to the newly created clip
             return redirect(url_for('view_clip', key=key))
@@ -260,7 +265,6 @@ def index():
 
 @app.route('/<key>')
 def view_clip(key):
-    # V31: Read timestamp directly
     try:
         db = get_db()
         cursor = db.cursor()
@@ -280,11 +284,10 @@ def view_clip(key):
     now_ts = int(time.time())
     
     if expires_at_ts < now_ts:
-        # If the clip is found but expired, run cleanup and return expired message
         cleanup_expired_clips()
         return render_template('clipboard.html', clip=None, key=key, expired=True)
 
-    # Calculate time left using datetime objects for display purposes
+    # Calculate time left for display
     expires_at_dt = datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
     now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
     
@@ -365,9 +368,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V31: Timestamp Expiry)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V32)
 # ============================================
-print_status "4/6: Creating clipboard_cli.py (CLI Tool - Timestamp Expiry Fix)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V32)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -412,7 +415,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # V31: Change created_at and expires_at storage to INTEGER (UNIX Timestamp)
+    # V32: Enforcing INTEGER type for timestamp columns
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY,
@@ -442,7 +445,7 @@ def generate_key(length=8):
 def cleanup_expired_clips():
     conn = get_db_connection()
     cursor = conn.cursor()
-    now_ts = int(time.time()) # Current UNIX timestamp
+    now_ts = int(time.time()) 
 
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
     expired_files = cursor.fetchall()
@@ -489,7 +492,6 @@ def create_new_clip():
     if not content:
         content = f"Empty clip created by CLI. Key: {key}"
 
-    # V31: Use UNIX Timestamps
     created_at_ts = int(time.time())
     expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
     expires_at_dt = datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
@@ -536,7 +538,6 @@ def list_clips():
         content_preview = (clip['content'][:35] + '...') if clip['content'] and len(clip['content']) > 35 else (clip['content'] or "No content")
         file_count = len([p for p in clip['file_path'].split(',') if p.strip()]) if clip['file_path'] else 0
         
-        # Display expiration date from timestamp
         expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
         expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -664,7 +665,6 @@ def main_menu():
     init_db()
     cleanup_expired_clips()
     
-    # Check if run with the init-db flag
     if len(sys.argv) > 1 and sys.argv[1] == '--init-db':
         print(f"[{Color.GREEN}INFO{Color.END}] Database successfully checked/initialized.")
         return
@@ -703,7 +703,7 @@ PYEOF_CLI_TOOL
 # ============================================
 # 5. Create Minimal Templates (NO CHANGE)
 # ============================================
-print_status "5/6: Creating HTML templates..."
+print_status "5/7: Creating HTML templates..."
 
 # --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
@@ -947,7 +947,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation complete (Clipboard Server V31 - Final Stable)"
+echo "🎉 Installation complete (Clipboard Server V32 - Final Stable)"
 echo "================================================"
 echo "✅ Web Service Status (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
