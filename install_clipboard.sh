@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V32 - FINAL STABILITY: Ensures immediate database visibility after creation by enforcing DB path cleanup and re-initialization.
+# V33 - FINAL STABILITY: Removed WAL Journal Mode for high compatibility and immediate visibility between Gunicorn workers.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V32 - Final Stability Fix)"
+echo "📋 Internet Clipboard Server Installer (V33 - SQLite Final Fix)"
 echo "=================================================="
 
 # ============================================
@@ -38,9 +38,10 @@ echo "=================================================="
 # ============================================
 print_status "1/7: Preparing system, virtual environment, and cleaning old DB..."
 
-# Stop service if running and remove old database files
+# Stop service if running and remove old database files and contents
 systemctl stop clipboard.service 2>/dev/null || true
 rm -f "${DATABASE_PATH}" "${DATABASE_PATH}-shm" "${DATABASE_PATH}-wal"
+rm -rf "${INSTALL_DIR}/uploads/*"
 
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
@@ -85,9 +86,9 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V32: Final stability checks)
+# 3. Create web_service.py (V33: No WAL, Explicit Isolation)
 # ============================================
-print_status "3/7: Creating web_service.py (V32 - Final stability checks)..."
+print_status "3/7: Creating web_service.py (V33 - SQLite Final Fix)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -119,14 +120,15 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
+            # Use default journal mode (rollback) for better worker stability and visibility
+            # Set isolation_level=None for autocommit/explicit commit control
             db = g._database = sqlite3.connect(
-                f'file:{DATABASE_PATH}?mode=rw', 
-                uri=True, 
+                DATABASE_PATH, 
                 timeout=10, 
-                check_same_thread=False 
+                check_same_thread=False,
+                isolation_level=None # Critical for autocommit/explicit control
             )
             db.row_factory = sqlite3.Row 
-            db.execute('PRAGMA journal_mode=WAL') 
             db.execute('PRAGMA foreign_keys=ON') 
         except sqlite3.OperationalError as e:
             print(f"[FATAL] Could not connect to database at {DATABASE_PATH}: {e}")
@@ -233,7 +235,7 @@ def index():
                 except: pass
             return redirect(url_for('index'))
             
-        # Database Insertion (V32: Use UNIX Timestamps & Final Commit)
+        # Database Insertion (V33: Final Commit)
         created_at_ts = int(time.time())
         expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
         file_path_string = ','.join(file_paths)
@@ -243,7 +245,8 @@ def index():
                 "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
                 (key, content, file_path_string, created_at_ts, expires_at_ts)
             )
-            db.commit() # Crucial: Commit immediately after INSERT
+            # Crucial: Commit immediately after INSERT, using rollback journal mode guarantees visibility.
+            db.commit() 
             
             # Redirect to the newly created clip
             return redirect(url_for('view_clip', key=key))
@@ -268,6 +271,8 @@ def view_clip(key):
     try:
         db = get_db()
         cursor = db.cursor()
+        # V33: Adding a small delay might help flush cache in extreme high concurrency, but commit should fix it.
+        # time.sleep(0.05) 
         cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
         clip = cursor.fetchone()
     except RuntimeError:
@@ -368,9 +373,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V32)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V33)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V32)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V33)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -408,14 +413,15 @@ class Color:
 
 # --- Database Management ---
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
+    # V33: Using isolation_level=None to match web service behavior for explicit commit
+    conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # V32: Enforcing INTEGER type for timestamp columns
+    # V33: Removed PRAGMA journal_mode=WAL
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY,
@@ -426,7 +432,6 @@ def init_db():
             expires_at INTEGER NOT NULL
         )
     """)
-    cursor.execute('PRAGMA journal_mode=WAL')
     conn.commit()
     conn.close()
 
@@ -947,7 +952,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation complete (Clipboard Server V32 - Final Stable)"
+echo "🎉 Installation complete (Clipboard Server V33 - Final Stable)"
 echo "================================================"
 echo "✅ Web Service Status (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
