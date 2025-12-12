@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V10 - Final: Enhanced Admin Panel Design & Full English Localization.
+# V11 - Final: Multi-Remote-Link Support, Admin Notice Removed, English.
 
 set -e
 
@@ -25,7 +25,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V10 - Enhanced Admin UI & English)"
+echo "📋 Internet Clipboard Server Installer (V11 - Multi-Remote-Link & Clean UI)"
 echo "=================================================="
 
 
@@ -72,9 +72,9 @@ MAX_REMOTE_SIZE_MB=50
 ENVEOF
 
 # ============================================
-# 3. Create app.py (V10 - English and Admin Update)
+# 3. Create app.py (V11 - Multi-Remote-Link Logic)
 # ============================================
-print_status "3/6: Creating app.py (V10 - English and Admin Update)..."
+print_status "3/6: Creating app.py (V11 - Multi-Remote-Link Logic)..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF'
 import os
 import sqlite3
@@ -123,7 +123,7 @@ def init_db():
                 id INTEGER PRIMARY KEY,
                 key TEXT UNIQUE NOT NULL,
                 content TEXT,
-                file_path TEXT,
+                file_path TEXT, 
                 created_at DATETIME NOT NULL,
                 expires_at DATETIME NOT NULL
             )
@@ -133,11 +133,9 @@ def init_db():
 # --- Security Decorator: Restrict Access to Localhost ---
 def local_access_only(f):
     def wrap(*args, **kwargs):
-        # Check if the request comes from localhost (127.0.0.1) or local IPv6 (::1)
         if request.remote_addr in ('127.0.0.1', '::1'):
             return f(*args, **kwargs)
         else:
-            # Block external access to admin panel
             return "Access Denied: Admin panel is only available from localhost.", 403
     wrap.__name__ = f.__name__ 
     return wrap
@@ -163,19 +161,21 @@ def cleanup_expired_clips():
     expired_files = cursor.fetchall()
 
     for file_path_tuple in expired_files:
-        file_path = file_path_tuple[0]
-        full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
-        if file_path and os.path.exists(full_path):
-            try:
-                os.remove(full_path)
-            except OSError as e:
-                print(f"Error removing file {full_path}: {e}")
+        file_paths = file_path_tuple[0].split(',') if file_path_tuple[0] else []
+        for file_path in file_paths:
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+            if file_path and os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                except OSError as e:
+                    print(f"Error removing file {full_path}: {e}")
             
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
     db.commit()
 
 
-def download_remote_file(url, key):
+def download_remote_file(url, key_prefix, index):
+    """Downloads a single remote file and returns its relative path or an error string."""
     try:
         with requests.get(url, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -184,22 +184,24 @@ def download_remote_file(url, key):
             if content_length and int(content_length) > MAX_REMOTE_SIZE_BYTES:
                 return "File size exceeds limit."
             
-            filename = ""
+            # Try to get filename from headers
+            filename = f"file_{index}"
             if 'Content-Disposition' in r.headers:
                 filename_header = r.headers['Content-Disposition']
                 match = re.search(r'filename=["\']?([^"\']+)["\']?', filename_header)
                 if match:
                     filename = match.group(1)
             
-            if not filename:
+            # Fallback to URL path
+            if filename == f"file_{index}":
                 path = urllib.parse.urlparse(url).path
                 filename = os.path.basename(path)
                 if not filename or filename.count('.') < 1:
-                    filename = "remote_file.bin" 
+                    filename = f"remote_file_{index}.bin" 
             
             safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
             
-            file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{safe_filename}")
+            file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key_prefix}_{index}_{safe_filename}")
             file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
             
             downloaded_size = 0
@@ -256,14 +258,18 @@ def index():
 def create_clip():
     content = request.form.get('content')
     uploaded_file = request.files.get('file')
-    remote_url = request.form.get('remote_url', '').strip()
+    remote_urls_input = request.form.get('remote_urls', '').strip()
     custom_key = request.form.get('custom_key', '').strip()
 
-    if not content and (not uploaded_file or not uploaded_file.filename) and not remote_url:
-        flash('You must provide text, a local file, or a remote URL.', 'error')
+    is_content_empty = not content
+    is_local_file_empty = (not uploaded_file or not uploaded_file.filename)
+    is_remote_urls_empty = not remote_urls_input
+
+    if is_content_empty and is_local_file_empty and is_remote_urls_empty:
+        flash('You must provide text, a local file, or remote URLs.', 'error')
         return redirect(url_for('index'))
 
-    form_data_for_flash = {'content': content, 'custom_key': custom_key, 'remote_url': remote_url}
+    form_data_for_flash = {'content': content, 'custom_key': custom_key, 'remote_urls': remote_urls_input}
     error_messages = []
 
     # 1. Key determination and validation
@@ -271,7 +277,6 @@ def create_clip():
     if custom_key:
         if not re.match(KEY_REGEX, custom_key):
             error_messages.append('error:Custom key must contain only English letters, numbers, hyphen (-), or underscore (_) and be between 3 and 64 characters long.')
-            
         else:
             key = custom_key
             db = get_db()
@@ -287,36 +292,46 @@ def create_clip():
     if not key:
         key = generate_key()
 
-    file_path = None
+    file_paths_list = []
     
-    # 2. Handle data/file upload
+    # 2. Handle single local file upload
     if uploaded_file and uploaded_file.filename:
         filename = uploaded_file.filename
-        file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{filename}")
+        file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_0_{filename}")
         file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
         uploaded_file.save(file_path_absolute)
-        file_path = file_path_relative
+        file_paths_list.append(file_path_relative)
     
-    elif remote_url:
-        if not remote_url.startswith(('http://', 'https://')):
-            error_messages.append('error:Remote URL is not valid (must start with http:// or https://).')
-        else:
-            download_result = download_remote_file(remote_url, key)
+    # 3. Handle multiple remote URLs
+    remote_urls = [url.strip() for url in remote_urls_input.split('\n') if url.strip()]
+    if remote_urls:
+        downloaded_count = 0
+        for i, url in enumerate(remote_urls):
+            if not url.startswith(('http://', 'https://')):
+                error_messages.append(f'error:Remote URL #{i+1} is not valid (must start with http:// or https://): {url[:50]}...')
+                continue
+            
+            download_result = download_remote_file(url, key, i)
             
             if download_result.startswith("Error") or download_result.startswith("File size"):
-                error_messages.append(f'error:❌ File Download Error: {download_result}')
+                error_messages.append(f'error:❌ File Download Error for URL #{i+1}: {download_result}')
             else:
-                file_path = download_result 
+                file_paths_list.append(download_result)
+                downloaded_count += 1
+
+    file_path_string = ','.join(file_paths_list)
 
     if error_messages:
+        # If there are file/download errors, redirect back with form data
+        # Note: If local file was uploaded before failure, it's already on the server but not in DB yet.
         flash_args = "||".join([f'form_data:{str(form_data_for_flash)}'] + error_messages)
         return redirect(url_for('index', flash_messages=flash_args))
 
-    if not content and file_path:
-        content = f"File uploaded via link: {file_path.split('_', 1)[-1]}"
+    if not content and file_paths_list:
+        content = "Files attached:\n" + "\n".join([f"{os.path.basename(p).split('_', 2)[-1]}" for p in file_paths_list])
 
-    if not content and not file_path:
-        error_messages.append('error:You must have content to save.')
+    if not content and not file_paths_list:
+        error_messages.append('error:You must have content or a file to save.')
         flash_args = "||".join([f'form_data:{str(form_data_for_flash)}'] + error_messages)
         return redirect(url_for('index', flash_messages=flash_args))
 
@@ -327,7 +342,7 @@ def create_clip():
         cursor = db.cursor()
         cursor.execute(
             "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (key, content, file_path, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+            (key, content, file_path_string, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
         )
         db.commit()
         
@@ -350,7 +365,7 @@ def view_clip(key):
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
 
-    content, file_path, expires_at_str = clip
+    content, file_path_string, expires_at_str = clip
     
     expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
     now_utc = datetime.now(timezone.utc)
@@ -367,19 +382,45 @@ def view_clip(key):
     expiry_info_days = days
     expiry_info_hours = hours
     expiry_info_minutes = minutes
+    
+    file_paths_list = file_path_string.split(',') if file_path_string else []
+    
+    # Prepare file info for display/download
+    files_info = []
+    for p in file_paths_list:
+        if p.strip():
+            filename_with_key = os.path.basename(p.strip())
+            # We skip the key_prefix and index part
+            original_filename = filename_with_key.split('_', 2)[-1] 
+            files_info.append({'path': p.strip(), 'name': original_filename})
+
 
     return render_template('clipboard.html', 
                            key=key, 
                            content=content, 
-                           file_path=file_path, 
+                           files_info=files_info,
                            expiry_info_days=expiry_info_days,
                            expiry_info_hours=expiry_info_hours,
                            expiry_info_minutes=expiry_info_minutes,
                            server_port=PORT)
 
 
-@app.route('/download/<key>')
-def download_file(key):
+@app.route('/download/<path:file_path>')
+def download_file(file_path):
+    # Sanity check: ensure the path belongs to the UPLOAD_FOLDER and is not manipulated
+    if not file_path.startswith(UPLOAD_FOLDER + '/'):
+         flash('Invalid download request.', 'error')
+         return redirect(url_for('index'))
+         
+    # Extract the clip key from the file path for expiry check (e.g., 'uploads/key_index_filename' -> 'key')
+    filename_part = os.path.basename(file_path)
+    try:
+        key = filename_part.split('_', 1)[0]
+    except IndexError:
+        flash('Invalid file path format.', 'error')
+        return redirect(url_for('index'))
+
+
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -389,27 +430,32 @@ def download_file(key):
         flash('File not found or link has expired.', 'error')
         return redirect(url_for('index'))
 
-    file_path_relative, expires_at_str = clip
+    file_paths_string, expires_at_str = clip
     
+    # Check if the requested file_path is actually associated with this clip
+    if file_path not in [p.strip() for p in file_paths_string.split(',')]:
+        flash('File not found in the associated clip.', 'error')
+        return redirect(url_for('view_clip', key=key))
+
+
     expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
     if expires_at < datetime.now(timezone.utc):
         cleanup_expired_clips()
         flash('File not found or link has expired.', 'error')
         return redirect(url_for('index'))
     
-    if file_path_relative:
-        filename_with_key = os.path.basename(file_path_relative)
-        original_filename = filename_with_key.split('_', 1)[-1] 
-        
-        return send_from_directory(UPLOAD_FOLDER, 
-                                   filename_with_key, 
-                                   as_attachment=True, 
-                                   download_name=original_filename)
     
-    flash('No file exists for this link.', 'error')
-    return redirect(url_for('view_clip', key=key))
+    filename_with_key = os.path.basename(file_path)
+    # We skip the key_prefix and index part
+    original_filename = filename_with_key.split('_', 2)[-1] 
+    
+    # The 'file_path' already contains the UPLOAD_FOLDER prefix, so we use send_from_directory parent directory
+    return send_from_directory(os.path.dirname(app.root_path), 
+                               file_path, 
+                               as_attachment=True, 
+                               download_name=original_filename)
 
-
+    
 # --- Admin Routes (Restricted to Localhost) ---
 
 @app.route('/admin')
@@ -418,19 +464,40 @@ def admin_panel():
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT id, key, SUBSTR(content, 1, 50) as content_preview, file_path, created_at, expires_at FROM clips ORDER BY created_at DESC")
-    clips = cursor.fetchall()
+    clips_db = cursor.fetchall()
     
+    # Calculate file count and size
     total_size = 0
+    total_files = 0
     upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_FOLDER)
-    for root, dirs, files in os.walk(upload_dir):
-        for name in files:
-            full_path = os.path.join(root, name)
-            if os.path.exists(full_path):
-                 total_size += os.path.getsize(full_path)
-            
+    for clip in clips_db:
+        if clip['file_path']:
+            file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
+            for file_path in file_paths:
+                 full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+                 if os.path.exists(full_path):
+                     total_size += os.path.getsize(full_path)
+                     total_files += 1
+
     total_size_mb = total_size / (1024 * 1024) 
     
-    return render_template('admin.html', clips=clips, total_size_mb=f"{total_size_mb:.2f}", server_port=PORT)
+    # Prepare clips list for template
+    clips = []
+    for clip in clips_db:
+        file_list = []
+        if clip['file_path']:
+             file_list = [os.path.basename(p.strip()).split('_', 2)[-1] for p in clip['file_path'].split(',') if p.strip()]
+        
+        clips.append({
+            'id': clip['id'],
+            'key': clip['key'],
+            'content_preview': clip['content_preview'],
+            'file_list': file_list,
+            'created_at': clip['created_at'].split(' ')[0],
+            'expires_at': clip['expires_at'].split(' ')[0],
+        })
+
+    return render_template('admin.html', clips=clips, total_size_mb=f"{total_size_mb:.2f}", total_files=total_files, server_port=PORT)
 
 
 @app.route('/admin/delete/<int:clip_id>', methods=['POST'])
@@ -443,15 +510,16 @@ def delete_clip(clip_id):
     clip = cursor.fetchone()
     
     if clip and clip['file_path']:
-        file_path = clip['file_path']
-        full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
-        if os.path.exists(full_path):
-            try:
-                os.remove(full_path)
-                flash(f'File for ID {clip_id} was successfully deleted.', 'success')
-            except OSError as e:
-                flash(f'Error deleting file: {e}', 'error')
-                return redirect(url_for('admin_panel'))
+        file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
+        for file_path in file_paths:
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+            if os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                    flash(f'File {file_path} successfully deleted.', 'success')
+                except OSError as e:
+                    flash(f'Error deleting file {file_path}: {e}', 'error')
+                    return redirect(url_for('admin_panel'))
 
     cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
     db.commit()
@@ -488,7 +556,6 @@ def edit_key(clip_id):
                 flash(f'❌ Error: Key **{new_key}** is already taken.', 'error')
                 return redirect(url_for('edit_key', clip_id=clip_id))
 
-        # Update key only
         cursor.execute(
             "UPDATE clips SET key = ? WHERE id = ?",
             (new_key, clip_id)
@@ -497,7 +564,11 @@ def edit_key(clip_id):
         flash(f'Key for Clip ID {clip_id} successfully updated to: {new_key}', 'success')
         return redirect(url_for('admin_panel'))
     
-    return render_template('edit_key.html', clip=clip)
+    # Prepare file info for template
+    file_paths_string = clip['file_path'] if clip['file_path'] else ""
+    file_list = [os.path.basename(p.strip()).split('_', 2)[-1] for p in file_paths_string.split(',') if p.strip()]
+
+    return render_template('edit_key.html', clip=clip, file_list=file_list)
 
 @app.route('/admin/edit_content/<int:clip_id>', methods=['GET', 'POST'])
 @local_access_only
@@ -515,7 +586,6 @@ def edit_content(clip_id):
     if request.method == 'POST':
         new_content = request.form.get('content')
 
-        # Update content only
         cursor.execute(
             "UPDATE clips SET content = ? WHERE id = ?",
             (new_content, clip_id)
@@ -524,7 +594,11 @@ def edit_content(clip_id):
         flash(f'Content for Clip ID {clip_id} successfully updated.', 'success')
         return redirect(url_for('admin_panel'))
     
-    return render_template('edit_content.html', clip=clip)
+    # Prepare file info for template
+    file_paths_string = clip['file_path'] if clip['file_path'] else ""
+    file_list = [os.path.basename(p.strip()).split('_', 2)[-1] for p in file_paths_string.split(',') if p.strip()]
+    
+    return render_template('edit_content.html', clip=clip, file_list=file_list)
 
 
 if __name__ == '__main__':
@@ -533,11 +607,11 @@ if __name__ == '__main__':
 PYEOF
 
 # ============================================
-# 4. Create index.html (English)
+# 4. Create index.html (Multi-URL Textarea)
 # ============================================
-print_status "4/6: Creating index.html (English)..."
+print_status "4/6: Creating index.html (Multi-URL Textarea)..."
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>Share text, a local file, or a remote URL between devices.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>Share text, a local file, or remote file URLs between devices.</p>
 {% if flashed_messages %}
 <ul style="list-style: none; padding: 0;">
 {% for category, message in flashed_messages %}
@@ -550,15 +624,18 @@ cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
     <p>— OR —</p>
     
     <div style="text-align: left; margin-bottom: 15px;">
-        <label for="file">Upload Local File:</label>
+        <label for="file">Upload Single Local File:</label>
         <input type="file" name="file" id="file" style="width: 100%; margin-top: 5px;">
     </div>
 
     <p>— OR —</p>
 
     <div style="text-align: left; margin-bottom: 15px;">
-        <label for="remote_url">Remote File URL (will be downloaded to server):</label>
-        <input type="text" name="remote_url" id="remote_url" placeholder="e.g., https://example.com/file.zip" value="{{ old_data.get('remote_url', '') }}" style="width: 100%; margin-top: 5px;">
+        <label for="remote_urls">Multiple Remote File URLs (one URL per line, will be downloaded to server):</label>
+        <textarea name="remote_urls" id="remote_urls" rows="4" placeholder="e.g.,
+https://example.com/file1.zip
+https://another.com/image.jpg
+">{{ old_data.get('remote_urls', '') }}</textarea>
     </div>
 
     <hr style="border: 1px dashed #ccc; margin: 15px 0;">
@@ -571,11 +648,14 @@ cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
 HTM_INDEX
 
 # ============================================
-# 5. Create clipboard.html (English)
+# 5. Create clipboard.html (Removed Admin Notice)
 # ============================================
-print_status "5/6: Creating clipboard.html (English)..."
+print_status "5/6: Creating clipboard.html (Removed Admin Notice, Multi-File Display)..."
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard: {{ key }}</h2>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }
+.file-list { list-style: none; padding: 0; }
+.file-list li { margin-bottom: 8px; }
+</style></head><body><div class="container"><h2>Clipboard: {{ key }}</h2>
 {% with messages = get_flashed_messages(with_categories=true) %}
 {% if messages %}
 <ul style="list-style: none; padding: 0;">
@@ -587,20 +667,18 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
 </ul>
 {% endif %}
 {% endwith %}
-{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>Attached File:</h3><p>Click below to download the file:</p><p><a href="{{ url_for('download_file', key=key) }}">Download File ({{ file_path.split('_', 1)[-1] }})</a></p></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
+{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
     **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">Create New Clip</a></p>
-    
-    <p style="margin-top: 20px; font-size: 0.8em; color: #999;">To access the Admin Panel, connect to the server via SSH and open <a href="http://127.0.0.1:{{ server_port }}/admin">http://127.0.0.1:{{ server_port }}/admin</a> in a local server browser (e.g., `lynx`).</p>
-    
 {% endif %}</div></body></html>
 HTM_CLIPBOARD
 
 # ============================================
-# 6. Create Admin Templates (admin.html, edit_key.html, edit_content.html)
+# 6. Create Admin Templates (admin.html, edit_key.html, edit_content.html) - No change from V10
 # ============================================
-print_status "6/6: Creating admin templates (English & New Design)..."
+print_status "6/6: Creating admin templates (No change to files in this step)..."
 
 # --- admin.html ---
+# The Admin panel structure from V10 already provides the requested table view and English text.
 cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title><style>
     body { font-family: Arial, sans-serif; background-color: #e9ebee; color: #333; padding: 20px; }
@@ -618,7 +696,7 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
     form.delete-form { display: inline; }
     button.delete-btn { background-color: #dc3545; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.9em; transition: background-color 0.3s; }
     button.delete-btn:hover { background-color: #c82333; }
-    span.file { background-color: #e9f7fe; padding: 3px 6px; border-radius: 3px; font-size: 0.85em; color: #0056b3; font-weight: bold; }
+    span.file { background-color: #e9f7fe; padding: 3px 6px; border-radius: 3px; font-size: 0.85em; color: #0056b3; font-weight: bold; margin-right: 5px;}
     .flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }
     .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }
     .stats { background-color: #f0f0f5; padding: 15px; border-radius: 6px; margin-bottom: 20px; text-align: left; }
@@ -626,6 +704,8 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
 </style></head><body><div class="container">
     <h2>Clipboard Admin Panel</h2>
     <div class="stats">
+        <p><b>Total Clips:</b> {{ clips|length }}</p>
+        <p><b>Total Uploaded Files:</b> {{ total_files }}</p>
         <p><b>Total Uploaded Size:</b> {{ total_size_mb }} MB</p>
         <p style="color: #777;">**Local Access Only:** This panel is only available via http://127.0.0.1:{{ server_port }}/admin</p>
     </div>
@@ -648,7 +728,7 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
                 <th>ID</th>
                 <th>Key/Link</th>
                 <th>Content Preview</th>
-                <th>File</th>
+                <th>Files ({{ total_files }})</th>
                 <th>Created At</th>
                 <th>Expires At</th>
                 <th>Actions</th>
@@ -659,10 +739,10 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN'
             <tr>
                 <td>{{ clip['id'] }}</td>
                 <td>{{ clip['key'] }}</td>
-                <td>{{ clip['content_preview'] }}{% if clip['content']|length > 50 %}...{% endif %}</td>
-                <td>{% if clip['file_path'] %}<span class="file">{{ clip['file_path'].split('_', 1)[-1] }}</span>{% else %}N/A{% endif %}</td>
-                <td>{{ clip['created_at'].split(' ')[0] }}</td>
-                <td>{{ clip['expires_at'].split(' ')[0] }}</td>
+                <td>{{ clip['content_preview'] }}{% if clip['content_preview']|length >= 50 %}...{% endif %}</td>
+                <td>{% if clip['file_list'] %}{% for file_name in clip['file_list'] %}<span class="file" title="{{ file_name }}">{{ file_name[:20] }}{% if file_name|length > 20 %}...{% endif %}</span>{% endfor %}{% else %}N/A{% endif %}</td>
+                <td>{{ clip['created_at'] }}</td>
+                <td>{{ clip['expires_at'] }}</td>
                 <td>
                     <a href="{{ url_for('view_clip', key=clip['key']) }}" class="button view" target="_blank">View</a>
                     <a href="{{ url_for('edit_key', clip_id=clip['id']) }}" class="button edit-key">Edit Key</a>
@@ -694,6 +774,7 @@ cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY'
     input[type="submit"]:hover { background-color: #e0a800; }
     .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }
     .info { background-color: #e9f7fe; padding: 10px; border-radius: 4px; margin-bottom: 15px; text-align: left; }
+    span.file { background-color: #e9f7fe; padding: 3px 6px; border-radius: 3px; font-size: 0.85em; color: #0056b3; font-weight: bold; margin-right: 5px;}
 </style></head><body><div class="container">
     <h2>Edit Clip Key (ID: {{ clip['id'] }})</h2>
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -711,7 +792,7 @@ cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY'
     <div class="info">
         <p><b>Current Key:</b> {{ clip['key'] }}</p>
         <p><b>Expires:</b> {{ clip['expires_at'].split(' ')[0] }}</p>
-        {% if clip['file_path'] %}<p><b>File:</b> {{ clip['file_path'].split('_', 1)[-1] }}</p>{% endif %}
+        <p><b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %}{% else %}N/A{% endif %}</p>
     </div>
 
     <form method="POST" action="{{ url_for('edit_key', clip_id=clip['id']) }}">
@@ -734,6 +815,7 @@ cat > "$INSTALL_DIR/templates/edit_content.html" << 'HTM_EDIT_CONTENT'
     input[type="submit"]:hover { background-color: #138496; }
     .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }
     .info { background-color: #e9f7fe; padding: 10px; border-radius: 4px; margin-bottom: 15px; text-align: left; }
+    span.file { background-color: #e9f7fe; padding: 3px 6px; border-radius: 3px; font-size: 0.85em; color: #0056b3; font-weight: bold; margin-right: 5px;}
 </style></head><body><div class="container">
     <h2>Edit Clip Content (ID: {{ clip['id'] }})</h2>
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -750,7 +832,7 @@ cat > "$INSTALL_DIR/templates/edit_content.html" << 'HTM_EDIT_CONTENT'
     
     <div class="info">
         <p><b>Key:</b> {{ clip['key'] }}</p>
-        {% if clip['file_path'] %}<p><b>File Attached:</b> {{ clip['file_path'].split('_', 1)[-1] }}</p>{% endif %}
+        <p><b>Files:</b> {% if file_list %}{% for file_name in file_list %}<span class="file">{{ file_name }}</span>{% endfor %}{% else %}N/A{% endif %}</p>
     </div>
 
     <form method="POST" action="{{ url_for('edit_content', clip_id=clip['id']) }}">
@@ -792,7 +874,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V10)"
+echo "🎉 Installation Complete (Clipboard Server V11)"
 echo "================================================"
 echo "✅ Service Status: $(systemctl is-active clipboard.service)"
 echo "🌐 Your server is running on port $PORT."
