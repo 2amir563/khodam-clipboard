@@ -1,6 +1,7 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
 # V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
+# FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
 
 set -e
 
@@ -30,7 +31,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 - Edit Clip Expiry)"
+echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix)"
 echo "=================================================="
 
 # ============================================
@@ -95,9 +96,9 @@ fi
 
 
 # ============================================
-# 3. Create web_service.py (V37 Logic - Retained)
+# 3. Create web_service.py (V37/V41 Logic - Retained)
 # ============================================
-print_status "3/7: Creating web_service.py (V37 Logic - Retained)..."
+print_status "3/7: Creating web_service.py (V41 Logic - Retained)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -831,17 +832,12 @@ def edit_clip_expiry():
         new_days = 0
         if new_days_str.startswith('+') or new_days_str.startswith('-'):
             adjustment_days = int(new_days_str)
-            # Calculate current total life days from creation time
-            created_at_ts = get_clip_by_id_or_key(clip_id_or_key)['expires_at'] - (clip['expires_at'] - time.time())
-            created_at_dt = datetime.fromtimestamp(created_at_ts, tz=timezone.utc)
             
-            # Calculate new expiry date based on adjustment from current expiry
+            # Find the original creation time (This is complex/buggy, simpler is: adjust from current expiry)
+            # Simpler approach: Calculate new expiry date based on adjustment from current expiry
             current_expiry_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
             new_expiry_dt = current_expiry_dt + timedelta(days=adjustment_days)
             
-            # Recalculate new total days from creation
-            time_difference = new_expiry_dt - created_at_dt
-            new_days = time_difference.days
         else:
             new_days = int(new_days_str)
             if new_days <= 0:
@@ -1011,11 +1007,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (V37 Logic - Retained)
+# 5. Create Minimal Templates (V41 + Fix Copy)
 # ============================================
-print_status "5/7: Creating HTML templates (V37 Logic - Retained)..."
+print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
 
-# --- index.html (V37 Fix) ---
+# --- index.html (Retained) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1097,7 +1093,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (V35 Logic) ---
+# --- clipboard.html (V41 + FIX: Reliable Copy Logic) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1135,7 +1131,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             {% endfor %}
         </div>
         
-        {# V35 FIX: Check if clip exists AND (has content OR has files_info). This prevents "Clip not found" if only a file is present. #}
+        {# V35 FIX: Check if clip exists AND (has content OR has files_info). #}
         {% if clip and (content or files_info) %}
             <h1>محتوای کلیپ برای: {{ key }}</h1>
             
@@ -1184,17 +1180,60 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 
     <script>
         function copyContent() {
-            const content = document.getElementById('text-content').innerText;
-            navigator.clipboard.writeText(content).then(() => {
-                alert('متن در کلیپ‌بورد کپی شد!');
-            }).catch(err => {
-                console.error('Could not copy text: ', err);
-            });
+            const contentElement = document.getElementById('text-content');
+            if (!contentElement) {
+                alert('عنصر متن پیدا نشد!');
+                return;
+            }
+            
+            // 1. Try modern clipboard API (async, preferred)
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(contentElement.innerText).then(() => {
+                    alert('متن در کلیپ‌بورد کپی شد! (API مدرن)');
+                }).catch(err => {
+                    // Fallback if permission is denied or API fails
+                    console.error('Copy failed (Modern API): ', err);
+                    copyFallback(contentElement);
+                });
+            } else {
+                // 2. Use deprecated execCommand fallback (synchronous)
+                copyFallback(contentElement);
+            }
+        }
+        
+        function copyFallback(element) {
+            try {
+                // Create a temporary textarea for selection/copying
+                const tempTextArea = document.createElement('textarea');
+                tempTextArea.value = element.innerText;
+                
+                // Hide the textarea visually
+                tempTextArea.style.position = 'fixed';
+                tempTextArea.style.top = '0';
+                tempTextArea.style.left = '0';
+                tempTextArea.style.opacity = '0';
+                
+                document.body.appendChild(tempTextArea);
+                
+                // Select and copy
+                tempTextArea.select();
+                tempTextArea.setSelectionRange(0, 99999); // For mobile devices
+                
+                // Use deprecated but widely supported copy command
+                document.execCommand('copy');
+                document.body.removeChild(tempTextArea);
+                
+                alert('متن در کلیپ‌بورد کپی شد! (روش سازگار)');
+            } catch (err) {
+                console.error('Copy failed (Fallback): ', err);
+                alert('خطا در کپی! لطفا متن را به صورت دستی انتخاب و کپی کنید.');
+            }
         }
     </script>
 </body>
 </html>
 CLIPBOARDEOF
+
 
 # --- error.html --- (No Change)
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
@@ -1273,7 +1312,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V41 - ویرایش انقضا کلیپ خاص)"
+echo "🎉 نصب کامل شد (Clipboard Server V41 + Fix کپی)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
