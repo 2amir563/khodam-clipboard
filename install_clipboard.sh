@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V27 - FINAL FIX: Force Gunicorn to use 1 worker to eliminate SQLite concurrency/locking issues.
+# V28 - FIX: Removed immediate cleanup on index() route to prevent premature deletion after creation/redirect issues.
 
 set -e
 
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V27 - Single Worker Fix)"
+echo "📋 Internet Clipboard Server Installer (V28 - Cleanup Fix)"
 echo "=================================================="
 
 # ============================================
@@ -78,9 +78,9 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (Full Submission + View Only - V27: Uses WAL mode)
+# 3. Create web_service.py (V28: Removed cleanup from index route)
 # ============================================
-print_status "3/6: Creating web_service.py (V27 - WAL mode DB config)..."
+print_status "3/6: Creating web_service.py (V28 - Cleanup Fix)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -112,8 +112,7 @@ ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        # V26/V27 FIX: Using check_same_thread=False and WAL mode. 
-        # Gunicorn is now restricted to 1 worker (V27) for stability.
+        # V26/V27 DB Settings: check_same_thread=False and WAL mode. 
         db = g._database = sqlite3.connect(
             f'file:{DATABASE_PATH}?mode=rw', 
             uri=True, 
@@ -171,7 +170,8 @@ def cleanup_expired_clips():
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    cleanup_expired_clips()
+    # V28 FIX: Cleanup removed from index route to prevent conflict with immediate creation/redirect
+    # cleanup_expired_clips()
     
     # 1. Handle form submission (POST)
     if request.method == 'POST':
@@ -246,6 +246,8 @@ def index():
 
 
     # 2. Handle GET request (Display form)
+    # Cleanup happens here to ensure expired clips are deleted on page load
+    cleanup_expired_clips()
     return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
 
 
@@ -355,7 +357,7 @@ PYEOF_WEB_SERVICE
 # 4. Create clipboard_cli.py (The CLI Management Tool - NO CHANGE)
 # ============================================
 print_status "4/6: Creating clipboard_cli.py (CLI Management Tool - No Change)..."
-# The content of clipboard_cli.py remains the same as V23/V24/V25 but we ensure its existence.
+# The content of clipboard_cli.py remains the same as previous versions.
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -848,7 +850,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# --- error.html (Same as V23) ---
+# --- error.html (Same as previous) ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -879,7 +881,7 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Single Service for Web View - V27: Workers set to 1)
+# 6. Create Systemd Service (V27: Workers set to 1)
 # ============================================
 print_status "6/7: Creating Systemd service for web server (Workers set to 1)..."
 
@@ -893,7 +895,7 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# FIXED: Changed --workers from 4 to 1 to eliminate SQLite locking issues.
+# FIXED: Workers set to 1 to eliminate all SQLite locking issues.
 ExecStart=${GUNICORN_VENV_PATH} --workers 1 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -910,7 +912,6 @@ SERVICEEOF
 print_status "7/7: Initializing Database and starting service..."
 
 # Initialize DB using the venv Python, ensuring the database file and table exist BEFORE Gunicorn starts
-# This step also ensures WAL mode is enabled for the first time
 "$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py" --init-db 
 
 systemctl daemon-reload
@@ -919,7 +920,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V27 - Single Worker Fix)"
+echo "🎉 Installation Complete (Clipboard Server V28 - Cleanup Fix)"
 echo "================================================"
 echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
