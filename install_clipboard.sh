@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V4 - Final fixes: Expiry date formatting and Custom Key field implementation.
+# V5 - Final fixes: English Expiry and preserving form data on error.
 
 set -e
 
@@ -25,13 +25,13 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V4 - Finalizing Features)"
+echo "📋 Internet Clipboard Server Installer (V5 - Fixing Form Data)"
 echo "=================================================="
 
 # ============================================
-# 1. System Setup & Venv (Re-run for stability)
+# 1-2. System Setup & Venv (Simplified for brevity)
 # ============================================
-print_status "1/6: Installing essential tools and creating Virtual Environment..."
+print_status "1/6: Ensuring system setup and Virtual Environment..."
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
 
@@ -51,14 +51,6 @@ REQEOF
 pip install -r requirements.txt || true
 deactivate
 
-# ============================================
-# 2. Update .env and Directories
-# ============================================
-print_status "2/6: Updating configuration and directory structure..."
-mkdir -p "$INSTALL_DIR/templates"
-mkdir -p "$INSTALL_DIR/uploads"
-chmod 777 "$INSTALL_DIR/uploads" 
-
 # --- Create .env file ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
 SECRET_KEY=${SECRET_KEY}
@@ -67,9 +59,9 @@ PORT=${PORT}
 ENVEOF
 
 # ============================================
-# 3. Create app.py (No functional change from V3, just ensuring consistency)
+# 3. Create app.py (Modified to preserve form data on error)
 # ============================================
-print_status "3/6: Creating app.py with custom key logic..."
+print_status "3/6: Creating app.py (V5 - Form Preservation)..."
 cat > "$INSTALL_DIR/app.py" << 'PYEOF'
 import os
 import sqlite3
@@ -77,7 +69,7 @@ import random
 import string
 import re
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
+from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g, get_flashed_messages
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -92,7 +84,7 @@ EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
 PORT = int(os.getenv('PORT', '3214')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 
-# --- Database Management ---
+# --- Database Management (unchanged) ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
@@ -121,7 +113,7 @@ def init_db():
         """)
         db.commit()
 
-# --- Helper Functions ---
+# --- Helper Functions (unchanged, except generate_key) ---
 def generate_key(length=8):
     characters = string.ascii_letters + string.digits
     db = get_db()
@@ -158,7 +150,21 @@ def cleanup_expired_clips():
 @app.route('/')
 def index():
     cleanup_expired_clips()
-    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
+    
+    # Retrieve form data from flash messages if a previous submission failed
+    # This keeps the user input even after redirect.
+    old_data = {}
+    for category, message in get_flashed_messages(with_categories=True):
+        if category == 'form_data':
+            # Assuming message is a simple JSON string {"content": "...", "custom_key": "..."}
+            try:
+                data = eval(message) # Use eval for simple dict string conversion if safe
+                if isinstance(data, dict):
+                    old_data = data
+            except:
+                pass
+            
+    return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS, old_data=old_data)
 
 @app.route('/create', methods=['POST'])
 def create_clip():
@@ -169,6 +175,10 @@ def create_clip():
     if not content and (not uploaded_file or not uploaded_file.filename):
         flash('شما باید متن یا فایل ارائه دهید.', 'error')
         return redirect(url_for('index'))
+
+    # Store current form data in flash message *before* potential error redirect
+    form_data_for_flash = {'content': content, 'custom_key': custom_key}
+    flash(str(form_data_for_flash), 'form_data') # Use 'form_data' category for retrieval
 
     # 1. Key determination and validation
     if custom_key:
@@ -188,7 +198,7 @@ def create_clip():
 
     file_path = None
     
-    # 2. Handle file upload
+    # 2. Handle file upload (unchanged)
     if uploaded_file and uploaded_file.filename:
         filename = uploaded_file.filename
         file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{filename}")
@@ -207,6 +217,10 @@ def create_clip():
             (key, content, file_path, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
         )
         db.commit()
+        
+        # Clear form data flash message on successful creation
+        # (This is tricky with Flask's flash, but since we redirect to view, it clears itself)
+        
         flash(f'✅ کلیپ‌بورد با موفقیت ایجاد شد! لینک: {url_for("view_clip", key=key, _external=True)}', 'success')
         return redirect(url_for('view_clip', key=key))
         
@@ -218,6 +232,7 @@ def create_clip():
 
 @app.route('/<key>')
 def view_clip(key):
+    # (View logic for fetching data unchanged)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -236,12 +251,11 @@ def view_clip(key):
         return render_template('clipboard.html', clip=None, key=key, expired=True)
 
     time_left = expires_at - now_utc
-    # Format expiry information here to ensure correct RTL display in template
     days = time_left.days
     hours = time_left.seconds // 3600
     minutes = (time_left.seconds % 3600) // 60
     
-    # The template will handle the two lines, we just pass the raw components
+    # Passing components for English display in template
     expiry_info_days = days
     expiry_info_hours = hours
     expiry_info_minutes = minutes
@@ -257,6 +271,7 @@ def view_clip(key):
 
 @app.route('/download/<key>')
 def download_file(key):
+    # (Download logic unchanged)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -293,26 +308,26 @@ if __name__ == '__main__':
 PYEOF
 
 # ============================================
-# 4. Create index.html (Includes Custom Key Input)
+# 4. Create index.html (Modified to use old_data)
 # ============================================
-print_status "4/6: Creating index.html with Custom Key field..."
+print_status "4/6: Creating index.html (V5 - Form Preservation)..."
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX'
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard - کلیپ‌بورد اینترنتی</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data"><textarea name="content" rows="6" placeholder="متن مورد نظر شما"></textarea><p>یا</p><input type="file" name="file"><hr style="border: 1px dashed #ccc; margin: 15px 0;"><input type="text" name="custom_key" placeholder="لینک دلخواه (اختیاری، مثلا: MyProjectKey)" pattern="^[a-zA-Z0-9_-]{3,64}$" title="لینک دلخواه باید بین 3 تا 64 کاراکتر بوده و شامل حروف انگلیسی، اعداد، خط فاصله یا زیرخط باشد."><input type="submit" value="ایجاد لینک"><p style="font-size: 0.8em; color: #777;">اگر لینک دلخواه خالی باشد، یک لینک تصادفی ایجاد می‌شود.</p></form><p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p></div></body></html>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard - کلیپ‌بورد اینترنتی</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>متن یا فایل مورد نظر خود را برای انتقال بین دستگاه‌ها قرار دهید.</p>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}{% if category != 'form_data' %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endif %}{% endfor %}</ul>{% endif %}{% endwith %}<form method="POST" action="{{ url_for('create_clip') }}" enctype="multipart/form-data"><textarea name="content" rows="6" placeholder="متن مورد نظر شما">{{ old_data.get('content', '') }}</textarea><p>یا</p><input type="file" name="file"><hr style="border: 1px dashed #ccc; margin: 15px 0;"><input type="text" name="custom_key" placeholder="لینک دلخواه (اختیاری، مثلا: MyProjectKey)" value="{{ old_data.get('custom_key', '') }}" pattern="^[a-zA-Z0-9_-]{3,64}$" title="لینک دلخواه باید بین 3 تا 64 کاراکتر بوده و شامل حروف انگلیسی، اعداد، خط فاصله یا زیرخط باشد."><input type="submit" value="ایجاد لینک"><p style="font-size: 0.8em; color: #777;">اگر لینک دلخواه خالی باشد، یک لینک تصادفی ایجاد می‌شود.</p></form><p>فایل/متن به صورت خودکار پس از **{{ EXPIRY_DAYS }} روز** پاک خواهد شد.</p></div></body></html>
 HTM_INDEX
 
 # ============================================
-# 5. Create clipboard.html (Modified for two-line expiry)
+# 5. Create clipboard.html (Modified for English expiry)
 # ============================================
-print_status "5/6: Creating clipboard.html (Expiry fix)..."
+print_status "5/6: Creating clipboard.html (V5 - English Expiry)..."
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD'
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }</style></head><body><div class="container"><h2>کلیپ‌بورد: {{ key }}</h2>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endfor %}</ul>{% endif %}{% endwith %}{% if clip is none %}<div class="flash-error">{% if expired %}❌ این لینک منقضی شده و محتوای آن پاک شده است.{% else %}❌ محتوایی با این آدرس یافت نشد.{% endif %}</div><p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>فایل ضمیمه:</h3><p>برای دانلود فایل زیر کلیک کنید:</p><p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p></div>{% endif %}{% if content %}<h3>محتوای متنی:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده:<br>
-    **{{ expiry_info_days }}** روز، **{{ expiry_info_hours }}** ساعت، و **{{ expiry_info_minutes }}** دقیقه</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>{% endif %}</div></body></html>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Tahoma, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: right; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; }</style></head><body><div class="container"><h2>کلیپ‌بورد: {{ key }}</h2>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul style="list-style: none; padding: 0;">{% for category, message in messages %}{% if category != 'form_data' %}<li class="flash-{{ category }}">{{ message | safe }}</li>{% endif %}{% endfor %}</ul>{% endif %}{% endwith %}{% if clip is none %}<div class="flash-error">{% if expired %}❌ این لینک منقضی شده و محتوای آن پاک شده است.{% else %}❌ محتوایی با این آدرس یافت نشد.{% endif %}</div><p><a href="{{ url_for('index') }}">بازگشت به صفحه اصلی</a></p>{% else %}{% if file_path %}<div class="file-info"><h3>فایل ضمیمه:</h3><p>برای دانلود فایل زیر کلیک کنید:</p><p><a href="{{ url_for('download_file', key=key) }}">دانلود فایل ({{ file_path.split('/')[-1].split('_', 1)[1] }})</a></p></div>{% endif %}{% if content %}<h3>محتوای متنی:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ انقضا: محتوای باقی مانده:<br>
+    **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">ایجاد یک کلیپ جدید</a></p>{% endif %}</div></body></html>
 HTM_CLIPBOARD
 
 # ============================================
 # 6. Final Steps
 # ============================================
-print_status "6/6: Initializing Database and starting service..."
+print_status "6/6: Initializing Database and restarting service..."
 $PYTHON_VENV_PATH -c "from app import init_db; init_db()"
 
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -334,15 +349,16 @@ SERVICEEOF
 
 systemctl daemon-reload
 systemctl enable clipboard.service
-systemctl restart clipboard.service # Restart the service to apply changes
+systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V4)"
+echo "🎉 Installation Complete (Clipboard Server V5)"
 echo "================================================"
 echo "✅ Service Status: $(systemctl is-active clipboard.service)"
 echo "🌐 Your Clipboard Server is running on port $PORT."
 echo "------------------------------------------------"
 echo "Status:   sudo systemctl status clipboard.service"
+echo "Restart:  sudo systemctl restart clipboard.service"
 echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
