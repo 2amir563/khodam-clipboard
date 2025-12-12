@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V40 - REMAINING EXPIRY TIME IN CLI: Added a 'Remaining' column to the clip list.
+# V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
 
 set -e
 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V40 - Remaining Time in CLI)"
+echo "📋 Internet Clipboard Server Installer (V41 - Edit Clip Expiry)"
 echo "=================================================="
 
 # ============================================
@@ -481,9 +481,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V40 - Remaining Time Display)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V41 - Edit Clip Expiry)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V40 - Remaining Time Display)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V41 - Edit Clip Expiry)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -505,7 +505,6 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
 
-# V40: These variables will be reloaded inside main_menu to get the latest value from .env
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
 BASE_URL = None 
@@ -537,7 +536,7 @@ class Color:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-# --- Utility Functions for .env management ---
+# --- Utility Functions ---
 def update_env_file(key, value):
     """Update a specific key-value pair in the .env file."""
     try:
@@ -587,7 +586,7 @@ def format_remaining_time(expiry_ts):
     else:
         return f"{minutes}m"
 
-# --- Database Management (Init, Cleanup, KeyGen - Same as V39) ---
+# --- Database Management ---
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -738,7 +737,7 @@ def list_clips():
 
     print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
     
-    # V40: Added Remaining column (Widths: ID:4, Key:10, Link:30, Content:24, Files:6, Remaining:10, Expires:20 => Total: 104)
+    # V40/V41 Widths: ID:4, Key:10, Link:30, Content:24, Files:6, Remaining:10, Expires:20 => Total: 104
     print(f"{Color.CYAN}{'ID':<4} {'Key':<10} {'Link (IP:Port/Key)':<30} {'Content Preview':<24} {'Files':<6} {'Remaining':<10} {'Expires (UTC)':<20}{Color.END}")
     print("-" * 104)
     
@@ -749,7 +748,7 @@ def list_clips():
         expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
         expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # V40: Calculate Remaining Time
+        # Calculate Remaining Time
         remaining_time = format_remaining_time(clip['expires_at'])
 
         # Prepare and display the full URL
@@ -799,10 +798,102 @@ def delete_clip():
     
     print(f"\n{Color.GREEN}✅ Clip ID {clip_id} (Key: {clip_key}) successfully deleted.{Color.END}")
 
+def get_clip_by_id_or_key(identifier):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if identifier.isdigit():
+        cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE id = ?", (int(identifier),))
+    else:
+        cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE key = ?", (identifier,))
+    clip = cursor.fetchone()
+    conn.close()
+    return clip
+
+def edit_clip_expiry():
+    list_clips()
+    clip_id_or_key = input("\nEnter the ID or Key of the clip to change expiry for: ").strip()
+    
+    clip = get_clip_by_id_or_key(clip_id_or_key)
+    
+    if not clip:
+        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
+        return
+
+    expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
+    remaining_time = format_remaining_time(clip['expires_at'])
+    
+    print(f"\n{Color.CYAN}--- Change Expiry for Clip ID {clip['id']} (Key: {clip['key']}) ---{Color.END}")
+    print(f"Current Expiry: {expires_at_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (Remaining: {remaining_time})")
+    
+    new_days_str = input("Enter NEW total duration in days (e.g., 60) OR '+' or '-' days to adjust (e.g., +10, -5): ").strip()
+
+    try:
+        new_days = 0
+        if new_days_str.startswith('+') or new_days_str.startswith('-'):
+            adjustment_days = int(new_days_str)
+            # Calculate current total life days from creation time
+            created_at_ts = get_clip_by_id_or_key(clip_id_or_key)['expires_at'] - (clip['expires_at'] - time.time())
+            created_at_dt = datetime.fromtimestamp(created_at_ts, tz=timezone.utc)
+            
+            # Calculate new expiry date based on adjustment from current expiry
+            current_expiry_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
+            new_expiry_dt = current_expiry_dt + timedelta(days=adjustment_days)
+            
+            # Recalculate new total days from creation
+            time_difference = new_expiry_dt - created_at_dt
+            new_days = time_difference.days
+        else:
+            new_days = int(new_days_str)
+            if new_days <= 0:
+                print(f"{Color.RED}Error: Total days must be a positive integer.{Color.END}")
+                return
+            
+            # Calculate new expiry date based on total new days from *current time*
+            new_expiry_dt = datetime.fromtimestamp(time.time(), tz=timezone.utc) + timedelta(days=new_days)
+
+        new_expires_at_ts = int(new_expiry_dt.timestamp())
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if the new expiry time is in the past
+        if new_expires_at_ts < int(time.time()):
+             print(f"{Color.RED}Error: New expiry date ({new_expiry_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}) is in the past. Use a larger number or '+' adjustment.{Color.END}")
+             conn.close()
+             return
+
+        cursor.execute("UPDATE clips SET expires_at = ? WHERE id = ?", (new_expires_at_ts, clip['id']))
+        conn.commit()
+        conn.close()
+        
+        new_remaining_time = format_remaining_time(new_expires_at_ts)
+        print(f"\n{Color.GREEN}✅ Success! Expiry updated.{Color.END}")
+        print(f"   {Color.BOLD}New Expiry:{Color.END} {new_expiry_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"   {Color.BOLD}Remaining:{Color.END} {new_remaining_time}")
+        
+    except ValueError:
+        print(f"{Color.RED}Error: Invalid input. Please enter a valid integer or use '+'/' adjustment (e.g., +5, -2, 60).{Color.END}")
+    except Exception as e:
+        print(f"{Color.RED}An unexpected error occurred: {e}{Color.END}")
+
 
 def edit_clip():
     list_clips()
-    clip_id_or_key = input("\nEnter the ID or Key of the clip to edit: ").strip()
+    
+    print(f"\n{Color.CYAN}--- Select Clip Editing Option ---{Color.END}")
+    print(f"1. Edit Key")
+    print(f"2. Edit Content")
+    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}") # V41: New Option
+    print(f"0. Cancel")
+    
+    choice = input("Enter your choice (1/2/3/0): ").strip()
+
+    if choice == '3':
+        edit_clip_expiry()
+        return
+
+    # Rest of the old logic for Key/Content editing
+    clip_id_or_key = input("\nEnter the ID or Key of the clip to edit (for Key/Content): ").strip()
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -821,15 +912,6 @@ def edit_clip():
 
     clip_id = clip['id']
     clip_key = clip['key']
-
-    print(f"\n{Color.CYAN}--- Edit Clip ID {clip_id} (Key: {clip_key}) ---{Color.END}")
-    print(f"Current Key: {Color.BOLD}{clip_key}{Color.END}")
-    print("--------------------------------------------------")
-    print(f"1. Edit Key")
-    print(f"2. Edit Content")
-    print(f"0. Cancel")
-    
-    choice = input("Enter your choice (1/2/0): ").strip()
 
     if choice == '1':
         new_key = input(f"Enter new key (Current: {clip_key}): ").strip()
@@ -872,13 +954,15 @@ def edit_clip():
     
     elif choice == '0':
         print("Editing cancelled.")
+    else:
+         print(f"{Color.RED}Invalid choice.{Color.END}")
 
     conn.close()
 
 def main_menu():
     global EXPIRY_DAYS, BASE_URL, SERVER_IP
     
-    # V40: Reload configuration before running the menu
+    # Reload configuration before running the menu
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
     EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
     CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
@@ -898,7 +982,7 @@ def main_menu():
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
         print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
-        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key or Content)")
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)") # V41: Updated description
         print(f"4. {Color.RED}Delete Clip{Color.END}")
         print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") 
         print("0. Exit")
@@ -1143,9 +1227,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V40)
+# 6. Create Systemd Service (Workers set to 2 in V41)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V40 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V41 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -1189,7 +1273,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V40 - نمایش زمان باقی‌مانده)"
+echo "🎉 نصب کامل شد (Clipboard Server V41 - ویرایش انقضا کلیپ خاص)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
