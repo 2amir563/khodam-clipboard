@@ -1,13 +1,13 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V38 - FULL LINK IN CLI LIST: Displays the full access URL for each clip in the CLI list view.
+# V39 - EXPIRY DURATION CHANGE IN CLI: Added option 5 to change the default EXPIRY_DAYS via the CLI.
 
 set -e
 
 # --- Configuration (Keep these consistent) ---
 INSTALL_DIR="/opt/clipboard_server"
 CLIPBOARD_PORT="3214" 
-EXPIRY_DAYS="30"
+EXPIRY_DAYS="30" # Default value
 DATABASE_PATH="${INSTALL_DIR}/clipboard.db"
 # Generate a secure secret key for Flask
 SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) 
@@ -30,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V38 - Full Link in CLI List)"
+echo "📋 Internet Clipboard Server Installer (V39 - CLI Expiry Change)"
 echo "=================================================="
 
 # ============================================
@@ -40,8 +40,8 @@ print_status "1/7: Preparing system, virtual environment, and cleaning old DB...
 
 # Stop service if running and remove old database files and contents
 systemctl stop clipboard.service 2>/dev/null || true
-rm -f "${DATABASE_PATH}" "${DATABASE_PATH}-shm" "${DATABASE_PATH}-wal"
-rm -rf "${INSTALL_DIR}/uploads/*"
+# rm -f "${DATABASE_PATH}" "${DATABASE_PATH}-shm" "${DATABASE_PATH}-wal" # Preserve DB/uploads from V38 onwards
+# rm -rf "${INSTALL_DIR}/uploads/*"
 
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
@@ -77,13 +77,25 @@ mkdir -p "$INSTALL_DIR/uploads"
 # Set ownership to root but allow others to write to uploads (if flask used another user)
 chmod -R 777 "$INSTALL_DIR" 
 
-# --- Create .env file (MAX_REMOTE_SIZE_MB removed) ---
-cat > "$INSTALL_DIR/.env" << ENVEOF
+# --- Create/Update .env file (EXPIRY_DAYS is dynamic now) ---
+# Check if .env exists and has SECRET_KEY, otherwise recreate with defaults
+if [ ! -f "$INSTALL_DIR/.env" ] || ! grep -q "SECRET_KEY" "$INSTALL_DIR/.env"; then
+    echo "Creating new .env file."
+    cat > "$INSTALL_DIR/.env" << ENVEOF
 SECRET_KEY=${SECRET_KEY}
 EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
+else
+    # Update CLIPBOARD_PORT and EXPIRY_DAYS if they don't exist or if we want to reset EXPIRY_DAYS
+    sed -i "/^CLIPBOARD_PORT=/c\CLIPBOARD_PORT=${CLIPBOARD_PORT}" "$INSTALL_DIR/.env"
+    if ! grep -q "EXPIRY_DAYS" "$INSTALL_DIR/.env"; then
+        echo "EXPIRY_DAYS=${EXPIRY_DAYS}" >> "$INSTALL_DIR/.env"
+    fi
+    sed -i "/^DOTENV_FULL_PATH=/c\DOTENV_FULL_PATH=${INSTALL_DIR}/.env" "$INSTALL_DIR/.env"
+fi
+
 
 # ============================================
 # 3. Create web_service.py (V37 Logic - Retained)
@@ -103,6 +115,7 @@ from werkzeug.utils import secure_filename
 import requests 
 
 # --- Configuration & Init ---
+# Reload environment variables for Flask every time, especially EXPIRY_DAYS
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
@@ -111,7 +124,7 @@ app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key')
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db') 
 UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
-EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
+EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) # V39: Use a distinct name for the default value
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
 
@@ -238,9 +251,13 @@ def download_and_save_file(url, key, file_paths):
 @app.route('/', methods=['GET', 'POST'])
 def index():
     
+    # V39: Reload environment variables to get current EXPIRY_DAYS_DEFAULT
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    current_expiry_days = int(os.getenv('EXPIRY_DAYS', '30'))
+
     # V36: Initialize default context for GET and error POSTs
     context = {
-        'EXPIRY_DAYS': EXPIRY_DAYS,
+        'EXPIRY_DAYS': current_expiry_days, # Use current value
         'old_content': '',
         'old_custom_key': '',
         'old_url_files': '' 
@@ -327,7 +344,8 @@ def index():
             
         # Database Insertion
         created_at_ts = int(time.time())
-        expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
+        # Use the current default expiry days 
+        expires_at_ts = int(created_at_ts + (current_expiry_days * 24 * 3600))
         file_path_string = ','.join(file_paths)
         
         try:
@@ -466,9 +484,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V38 - Full Link Display)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V39 - Expiry Duration Change)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V38 - Full Link Display)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V39 - Expiry Duration Change)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -478,7 +496,8 @@ import re
 import sys
 import time
 import argparse
-import socket # Added to try and determine the server's IP
+import socket 
+import shutil
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv, find_dotenv
 
@@ -488,24 +507,25 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
+
+# V39: This variable will be reloaded inside main_menu to get the latest value from .env
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
 CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
+BASE_URL = None # Will be set dynamically
 
 def get_server_ip():
     """Tries to get the public or local IP of the server."""
     try:
-        # Connect to a public server (doesn't send data) to get the local IP used for routing
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
     except Exception:
-        # Fallback if connection fails (e.g., no network)
         return "YOUR_IP"
 
+# Global setup variables
 SERVER_IP = get_server_ip()
-BASE_URL = f"http://{SERVER_IP}:{CLIPBOARD_PORT}" 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 
 # --- Colors ---
@@ -576,10 +596,66 @@ def cleanup_expired_clips():
     conn.commit()
     conn.close()
 
+# --- Utility Functions for .env management ---
+def update_env_file(key, value):
+    """Update a specific key-value pair in the .env file."""
+    try:
+        if not os.path.exists(DOTENV_PATH):
+            with open(DOTENV_PATH, 'w') as f:
+                f.write(f"{key}={value}\n")
+            return True
+
+        temp_path = DOTENV_PATH + '.tmp'
+        
+        updated = False
+        with open(DOTENV_PATH, 'r') as old, open(temp_path, 'w') as new:
+            for line in old:
+                if line.startswith(f"{key}="):
+                    new.write(f"{key}={value}\n")
+                    updated = True
+                else:
+                    new.write(line)
+            
+            if not updated:
+                new.write(f"{key}={value}\n")
+
+        shutil.move(temp_path, DOTENV_PATH)
+        return True
+    except Exception as e:
+        print(f"{Color.RED}Error updating .env file: {e}{Color.END}")
+        return False
+
 # --- Main CLI Functions ---
 
+def change_expiry_days():
+    global EXPIRY_DAYS
+    print(f"\n{Color.CYAN}{Color.BOLD}--- Change Default Expiry Duration ---{Color.END}")
+    print(f"Current default expiry is: {Color.BOLD}{EXPIRY_DAYS} days{Color.END}")
+    
+    new_days_str = input("Enter new default expiry in days (e.g., 5, 30, 90): ").strip()
+    
+    try:
+        new_days = int(new_days_str)
+        if new_days <= 0 or new_days > 3650:
+             print(f"{Color.RED}Error: Expiry must be a positive integer, typically between 1 and 3650 days.{Color.END}")
+             return
+             
+    except ValueError:
+        print(f"{Color.RED}Error: Invalid input. Please enter a valid integer for the number of days.{Color.END}")
+        return
+
+    if update_env_file('EXPIRY_DAYS', new_days_str):
+        EXPIRY_DAYS = new_days
+        print(f"\n{Color.GREEN}✅ Success! Default expiry updated to {Color.BOLD}{new_days} days.{Color.END}")
+        print(f"{Color.YELLOW}⚠️ NOTE: Changes apply to NEW clips only. You may need to restart the web service (sudo systemctl restart clipboard.service) for the change to take full effect on the web.{Color.END}")
+    else:
+        print(f"{Color.RED}Failed to update expiry duration.{Color.END}")
+
+
 def create_new_clip():
-    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip (CLI) ---{Color.END}")
+    global EXPIRY_DAYS
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip (Text Only) ---{Color.END}")
+    print(f"Clip will expire in {EXPIRY_DAYS} days.")
     content = input("Enter text content (leave blank for placeholder): ").strip()
     custom_key = input("Enter custom link key (optional, leave blank for random): ").strip()
 
@@ -644,9 +720,8 @@ def list_clips():
 
     print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
     
-    # V38: Added Link column
     # Widths: ID:4, Key:12, Link:35, Content:30, Files:6, Expires:20 => Total: 107
-    print(f"{Color.CYAN}{'ID':<4} {'Key':<12} {'Link':<35} {'Content Preview':<30} {'Files':<6} {'Expires (UTC)':<20}{Color.END}")
+    print(f"{Color.CYAN}{'ID':<4} {'Key':<12} {'Link (IP:Port/Key)':<35} {'Content Preview':<30} {'Files':<6} {'Expires (UTC)':<20}{Color.END}")
     print("-" * 107)
     
     for clip in clips:
@@ -656,7 +731,7 @@ def list_clips():
         expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
         expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # V38: Prepare and display the full URL
+        # Prepare and display the full URL
         full_link = f"{SERVER_IP}:{CLIPBOARD_PORT}/{clip['key']}"
         
         print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<12}{Color.END} {Color.UNDERLINE}{full_link:<35}{Color.END} {content_preview:<30} {file_count:<6} {expiry_date_utc:<20}")
@@ -780,6 +855,15 @@ def edit_clip():
     conn.close()
 
 def main_menu():
+    global EXPIRY_DAYS, BASE_URL, SERVER_IP
+    
+    # V39: Reload configuration before running the menu
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
+    CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
+    SERVER_IP = get_server_ip()
+    BASE_URL = f"http://{SERVER_IP}:{CLIPBOARD_PORT}"
+    
     init_db()
     cleanup_expired_clips()
     
@@ -795,6 +879,7 @@ def main_menu():
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
         print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key or Content)")
         print(f"4. {Color.RED}Delete Clip{Color.END}")
+        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") # V39: New Option
         print("0. Exit")
         
         choice = input("Enter your choice: ").strip()
@@ -807,6 +892,8 @@ def main_menu():
             edit_clip()
         elif choice == '4':
             delete_clip()
+        elif choice == '5': # V39: Handle new option
+            change_expiry_days()
         elif choice == '0':
             print(f"\n{Color.BOLD}Exiting CLI Management. Goodbye!{Color.END}")
             break
@@ -814,9 +901,6 @@ def main_menu():
             print(f"{Color.RED}Invalid choice. Please try again.{Color.END}")
 
 if __name__ == '__main__':
-    # Initialize the IP address before running the menu
-    SERVER_IP = get_server_ip()
-    BASE_URL = f"http://{SERVER_IP}:{CLIPBOARD_PORT}"
     main_menu()
 
 PYEOF_CLI_TOOL
@@ -1038,9 +1122,9 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V38)
+# 6. Create Systemd Service (Workers set to 2 in V39)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V38 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V39 Optimization)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -1084,13 +1168,13 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V38 - لینک کامل در CLI)"
+echo "🎉 نصب کامل شد (Clipboard Server V39 - تغییر مدت انقضا در CLI)"
 echo "================================================"
 echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
 echo "------------------------------------------------"
 echo "🌐 آدرس وب: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 مدیریت CLI (برای لیست/حذف کلیپ‌ها):"
+echo "💻 مدیریت CLI (برای لیست/حذف/تغییر انقضا):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
 echo "Logها:    sudo journalctl -u clipboard.service -f"
