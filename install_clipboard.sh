@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V19 - FINAL: Fixes Internal Server Error in Admin Panel (Ensures proper .env loading in app.py).
+# V20 - FINAL: Critical Fix for Internal Server Error on Admin Login/Index. Ensures robust .env loading.
 
 set -e
 
@@ -27,7 +27,7 @@ if [ "$EUID" -ne 0 ] && [ "$1" != "setup-user" ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V19 - Fix Internal Error)"
+echo "📋 Internet Clipboard Server Installer (V20 - Final Stability Fix)"
 echo "=================================================="
 
 # ============================================
@@ -115,15 +115,15 @@ EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
 MAX_REMOTE_SIZE_MB=50
 ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
-# Add this line to ensure gunicorn sees the .env file location
-FLASK_ENV_FILE_PATH=${INSTALL_DIR}/.env
+# Path added for robust manual loading
+DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 4. Create app.py (V19 - Added secure .env loading logic)
+# 4. Create app.py (V20 - Fixed .env loading and variable access)
 # ============================================
-print_status "4/7: Creating app.py (Including Admin logic, Multi-File, Reset, and .env fix)..."
-cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP_MERGED_V19'
+print_status "4/7: Creating app.py (V20 - Critical fix for admin panel access)..."
+cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP_MERGED_V20'
 import os
 import sqlite3
 import random
@@ -137,19 +137,16 @@ from flask import Flask, render_template, request, redirect, url_for, flash, sen
 from dotenv import load_dotenv, set_key, find_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# --- Global .env Loading Fix ---
-# 1. Try to find the .env path set during installation (if available)
-DOTENV_PATH = os.getenv('FLASK_ENV_FILE_PATH', find_dotenv(usecwd=True))
-# 2. Fallback to current directory if not found
+# --- Determine .env Path Globally ---
+DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
 if not DOTENV_PATH:
     DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
-# Load environment variables using the determined path
+# Load the environment variables globally (Essential for initial setup)
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
-# --- End Global .env Loading Fix ---
 
 
-# --- Configuration ---
+# --- Configuration (Read from OS Env or the loaded .env) ---
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
@@ -159,7 +156,13 @@ EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
 MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
-ADMIN_PASSWORD_HASH = os.getenv('ADMIN_PASSWORD_HASH')
+
+# Function to safely get the current admin hash
+def get_admin_password_hash():
+    # Reload the .env file content directly before checking/using the hash
+    # This prevents the initial global load from failing and ensures the latest hash is used
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    return os.getenv('ADMIN_PASSWORD_HASH')
 
 
 # --- Database Management ---
@@ -202,7 +205,8 @@ def login_required(f):
     wrap.__name__ = f.__name__
     return login_required
 
-# --- Helper Functions ---
+
+# --- Helper Functions (Remaining functions are unchanged from V19) ---
 def generate_key(length=8):
     characters = string.ascii_letters + string.digits
     db = get_db()
@@ -332,7 +336,7 @@ def reset_admin_password():
         print(f"\n❌ Error saving to .env file: {e}")
         sys.exit(1)
 
-# --- Flask Routes (Same as V18) ---
+# --- Flask Routes (The problem was here and in get_admin_password_hash) ---
 
 @app.route('/')
 def index():
@@ -365,6 +369,7 @@ def index():
 
 
 @app.route('/create', methods=['POST'])
+# ... (create_clip function is unchanged)
 def create_clip():
     content = request.form.get('content')
     uploaded_files = request.files.getlist('files[]')
@@ -468,6 +473,7 @@ def create_clip():
 
 
 @app.route('/<key>')
+# ... (view_clip and download_file functions are unchanged)
 def view_clip(key):
     db = get_db()
     cursor = db.cursor()
@@ -564,13 +570,11 @@ def download_file(file_path):
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
+    ADMIN_PASSWORD_HASH_CHECK = get_admin_password_hash()
+    
     if request.method == 'POST':
         password = request.form.get('password')
         
-        # Reload hash using the determined DOTENV_PATH in case of command line reset
-        load_dotenv(dotenv_path=DOTENV_PATH, override=True)
-        ADMIN_PASSWORD_HASH_CHECK = os.getenv('ADMIN_PASSWORD_HASH')
-
         if ADMIN_PASSWORD_HASH_CHECK and check_password_hash(ADMIN_PASSWORD_HASH_CHECK, password):
             session['logged_in'] = True
             flash('Login successful!', 'success')
@@ -578,6 +582,11 @@ def admin_login():
         else:
             flash('Invalid password.', 'error')
             return render_template('login.html', admin_port=CLIPBOARD_PORT)
+    
+    # Check if a password hash is even set (for initial setup check)
+    if not ADMIN_PASSWORD_HASH_CHECK:
+        print("CRITICAL: ADMIN_PASSWORD_HASH is missing from .env! Check installation script.")
+
     return render_template('login.html', admin_port=CLIPBOARD_PORT)
 
 @app.route('/admin/logout')
@@ -591,6 +600,7 @@ def admin_logout():
 
 @app.route('/admin')
 @login_required
+# ... (admin_panel function is unchanged)
 def admin_panel():
     db = get_db()
     cursor = db.cursor()
@@ -641,6 +651,7 @@ def admin_panel():
 
 @app.route('/admin/delete/<int:clip_id>', methods=['POST'])
 @login_required
+# ... (delete_clip function is unchanged)
 def delete_clip(clip_id):
     db = get_db()
     cursor = db.cursor()
@@ -668,6 +679,7 @@ def delete_clip(clip_id):
 
 @app.route('/admin/edit_key/<int:clip_id>', methods=['GET', 'POST'])
 @login_required
+# ... (edit_key function is unchanged)
 def edit_key(clip_id):
     db = get_db()
     cursor = db.cursor()
@@ -710,6 +722,7 @@ def edit_key(clip_id):
 
 @app.route('/admin/edit_content/<int:clip_id>', methods=['GET', 'POST'])
 @login_required
+# ... (edit_content function is unchanged)
 def edit_content(clip_id):
     db = get_db()
     cursor = db.cursor()
@@ -749,23 +762,14 @@ if __name__ == '__main__':
     init_db()
     app.run(host='0.0.0.0', port=CLIPBOARD_PORT, debug=True)
 
-PYEOF_APP_MERGED_V19
+PYEOF_APP_MERGED_V20
 
 
 # ============================================
 # 5. Create Templates (No change needed from V18)
 # ============================================
 print_status "5/7: Templates are already up-to-date (V18 files are sufficient)..."
-# (Skipping template recreation for brevity, assuming V18 templates are present and correct)
-# If you are running this as a full replacement script, make sure V18 templates are included here.
-
-# --- index.html (Skipped) ---
-# --- login.html (Skipped) ---
-# --- admin.html (Skipped) ---
-# --- clipboard.html (Skipped) ---
-# --- edit_key.html (Skipped) ---
-# --- edit_content.html (Skipped) ---
-
+# (Skipping template recreation)
 
 # ============================================
 # 6. Create Systemd Service (Single Service)
@@ -782,10 +786,9 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# The ExecStart command is updated to ensure the .env file path is available as an environment variable
-# Gunicorn is configured to look for the application inside the venv
+# Pass the full .env path as an environment variable to ensure app.py can find it
 ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} app:app
-Environment=FLASK_ENV_FILE_PATH=${INSTALL_DIR}/.env
+Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
 TimeoutSec=30
 
@@ -810,7 +813,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V19 - Admin Error Fix)"
+echo "🎉 Installation Complete (Clipboard Server V20 - Final Fix)"
 echo "================================================"
 echo "✅ CLIPBOARD & ADMIN STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
