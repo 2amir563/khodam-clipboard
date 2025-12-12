@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V24 - Returns the full functionality for creating clips (Text/File) via the web interface.
+# V25 - FIX: SQLite concurrency issue (Clip Not Found on redirect) using URI mode.
 
 set -e
 
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V24 - Full Web Submission / CLI Management)"
+echo "📋 Internet Clipboard Server Installer (V25 - SQLite Concurrency Fix)"
 echo "=================================================="
 
 # ============================================
@@ -66,7 +66,6 @@ print_status "2/6: Updating configuration and ensuring directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
-# This is crucial for file uploads from the web
 chmod 777 "$INSTALL_DIR/uploads" 
 
 # --- Create .env file ---
@@ -81,7 +80,7 @@ ENVEOF
 # ============================================
 # 3. Create web_service.py (Full Submission + View Only)
 # ============================================
-print_status "3/6: Creating web_service.py (Full Submission + View Only)..."
+print_status "3/6: Creating web_service.py (Full Submission + View Only - V25 Fix)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -113,7 +112,12 @@ ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE_PATH)
+        # FIX V25: Use URI mode and timeout to handle Gunicorn concurrency and database locking issues
+        db = g._database = sqlite3.connect(
+            f'file:{DATABASE_PATH}?mode=rw', 
+            uri=True, 
+            timeout=10 # Wait up to 10 seconds for database lock
+        )
         db.row_factory = sqlite3.Row 
     return db
 
@@ -180,7 +184,7 @@ def index():
         key = custom_key or generate_key()
         
         # Validate key
-        if not re.match(KEY_REGEX, key):
+        if custom_key and not re.match(KEY_REGEX, custom_key):
             flash('Invalid custom key format.', 'error')
             return redirect(url_for('index'))
             
@@ -347,7 +351,7 @@ PYEOF_WEB_SERVICE
 # 4. Create clipboard_cli.py (The CLI Management Tool - NO CHANGE)
 # ============================================
 print_status "4/6: Creating clipboard_cli.py (CLI Management Tool - No Change)..."
-# We re-create it just to ensure its existence, its content is the same as V23
+# The content of clipboard_cli.py remains the same as V23/V24 but we ensure its existence.
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -384,6 +388,7 @@ class Color:
 
 # --- Database Management ---
 def get_db_connection():
+    # CLI tool is single-threaded, so standard connection is fine here
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -669,9 +674,9 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (Full Web Submission Form)
+# 5. Create Minimal Templates (Full Web Submission Form - NO CHANGE)
 # ============================================
-print_status "5/6: Creating HTML templates (Web Submission Form)..."
+print_status "5/6: Creating HTML templates (Web Submission Form - No Change)..."
 
 # --- index.html (FULL SUBMISSION FORM) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
@@ -908,7 +913,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V24 - Web Submission & CLI Management)"
+echo "🎉 Installation Complete (Clipboard Server V25 - Final Concurrency Fix)"
 echo "================================================"
 echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
