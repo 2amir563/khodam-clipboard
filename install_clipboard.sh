@@ -1,10 +1,10 @@
 #!/bin/bash
-# Internet Clipboard Server Installer (CLI Management + Simple Web Viewer)
-# V23 - FINAL STABILITY FIX: Ensures database initialization before web service start.
+# Internet Clipboard Server Installer (CLI Management + Full Web Submission)
+# V24 - Returns the full functionality for creating clips (Text/File) via the web interface.
 
 set -e
 
-# --- Configuration ---
+# --- Configuration (Keep these consistent) ---
 INSTALL_DIR="/opt/clipboard_server"
 CLIPBOARD_PORT="3214" 
 EXPIRY_DAYS="30"
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V23 - Final Stable CLI/Light Mode)"
+echo "📋 Internet Clipboard Server Installer (V24 - Full Web Submission / CLI Management)"
 echo "=================================================="
 
 # ============================================
@@ -49,7 +49,7 @@ source venv/bin/activate || true
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# Using a minimal list of dependencies
+# Ensure dependencies are installed
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
@@ -66,6 +66,7 @@ print_status "2/6: Updating configuration and ensuring directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
+# This is crucial for file uploads from the web
 chmod 777 "$INSTALL_DIR/uploads" 
 
 # --- Create .env file ---
@@ -74,23 +75,25 @@ SECRET_KEY=${SECRET_KEY}
 EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
 MAX_REMOTE_SIZE_MB=50
-# Path added for robust manual loading
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (Simplified Flask for view only)
+# 3. Create web_service.py (Full Submission + View Only)
 # ============================================
-print_status "3/6: Creating web_service.py (Simplified view-only web server)..."
+print_status "3/6: Creating web_service.py (Full Submission + View Only)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
 import re
 import requests
 import urllib.parse
+import string
+import random
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
+from werkzeug.utils import secure_filename
 
 # --- Configuration & Init ---
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
@@ -98,19 +101,18 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
-# IMPORTANT: Use absolute path for DB connection
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db') 
 UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30')) 
+MAX_REMOTE_SIZE_BYTES = int(os.getenv('MAX_REMOTE_SIZE_MB', 50)) * 1024 * 1024 
+KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
 
-# --- Database Management ---
+# --- Utility Functions ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        # Check if DB file exists before connecting, if not, it should be created by CLI
-        if not os.path.exists(DATABASE_PATH):
-            print(f"CRITICAL: Database file not found at {DATABASE_PATH}. Service may fail.")
         db = g._database = sqlite3.connect(DATABASE_PATH)
         db.row_factory = sqlite3.Row 
     return db
@@ -121,13 +123,26 @@ def close_connection(exception):
     if db is not None:
         db.close()
 
-# --- Cleanup (Only runs on view/index access) ---
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def generate_key(length=8):
+    characters = string.ascii_letters + string.digits
+    conn = get_db()
+    cursor = conn.cursor()
+    while True:
+        key = ''.join(random.choice(characters) for i in range(length))
+        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
+        exists = cursor.fetchone()
+        if not exists:
+            return key
+
 def cleanup_expired_clips():
     db = get_db()
     cursor = db.cursor()
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-    # Delete files associated with expired clips
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
     expired_files = cursor.fetchall()
 
@@ -141,16 +156,88 @@ def cleanup_expired_clips():
                 except OSError as e:
                     print(f"[WARNING] Error removing file {full_path}: {e}")
             
-    # Delete clips from DB
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
     db.commit()
 
+# --- Main Routes (Submission is back on /) ---
 
-# --- Simple Routes (No Admin Panel) ---
-
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def index():
     cleanup_expired_clips()
+    
+    # 1. Handle form submission (POST)
+    if request.method == 'POST':
+        content = request.form.get('content', '').strip()
+        custom_key = request.form.get('custom_key', '').strip()
+        
+        uploaded_files = request.files.getlist('files')
+        has_content = content or any(f.filename for f in uploaded_files)
+        
+        if not has_content:
+            flash('Please provide text content or upload at least one file.', 'error')
+            return redirect(url_for('index'))
+
+        key = custom_key or generate_key()
+        
+        # Validate key
+        if not re.match(KEY_REGEX, key):
+            flash('Invalid custom key format.', 'error')
+            return redirect(url_for('index'))
+            
+        # Check for key existence
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
+        if cursor.fetchone():
+            flash(f'Key "{key}" is already in use. Please choose another.', 'error')
+            return redirect(url_for('index'))
+            
+        # File Handling
+        file_paths = []
+        try:
+            for file in uploaded_files:
+                if file and file.filename and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    # Unique filename structure: key_original-filename
+                    unique_filename = f"{key}_{filename}"
+                    full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+                    
+                    # Save the file
+                    file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
+                    file_paths.append(full_path)
+                elif file.filename and not allowed_file(file.filename):
+                     flash(f'File type not allowed: {file.filename}', 'error')
+                     return redirect(url_for('index'))
+                     
+        except Exception as e:
+            flash(f'File upload error: {e}', 'error')
+            # Clean up files uploaded so far if an error occurs
+            for fp in file_paths:
+                try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
+                except: pass
+            return redirect(url_for('index'))
+            
+        # Database Insertion
+        expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
+        file_path_string = ','.join(file_paths)
+        
+        try:
+            cursor.execute(
+                "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (key, content, file_path_string, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            db.commit()
+            
+            # Redirect to the newly created clip
+            return redirect(url_for('view_clip', key=key))
+            
+        except sqlite3.OperationalError as e:
+             print(f"SQLITE ERROR: {e}")
+             flash("Database error during clip creation. Check server logs.", 'error')
+             return redirect(url_for('index'))
+
+
+    # 2. Handle GET request (Display form)
     return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
 
 
@@ -163,9 +250,8 @@ def view_clip(key):
         cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
         clip = cursor.fetchone()
     except sqlite3.OperationalError as e:
-        # This catches errors like 'no such table: clips' which is the underlying cause of Internal Server Error
         print(f"SQLITE ERROR: {e}")
-        return render_template('error.html', message="Database is not initialized or corrupted. Please run the CLI tool on the server to fix."), 500
+        return render_template('error.html', message="Database is not initialized or corrupted. Please run the CLI tool on the server."), 500
 
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
@@ -190,7 +276,6 @@ def view_clip(key):
     for p in file_paths_list:
         if p.strip():
             filename_with_key = os.path.basename(p.strip())
-            # Safely extract original filename
             try:
                 original_filename = filename_with_key.split('_', 2)[-1] 
             except IndexError:
@@ -210,12 +295,11 @@ def view_clip(key):
 
 @app.route('/download/<path:file_path>')
 def download_file(file_path):
-    # Security check for file path
+    # This remains the same as previous versions
     if not file_path.startswith(UPLOAD_FOLDER + '/'):
          flash('Invalid download request.', 'error')
          return redirect(url_for('index'))
          
-    # Extract key from filename
     filename_part = os.path.basename(file_path)
     try:
         key = filename_part.split('_', 1)[0]
@@ -234,7 +318,6 @@ def download_file(file_path):
 
     file_paths_string, expires_at_str = clip
     
-    # Check if the requested file_path is actually part of the clip
     if file_path not in [p.strip() for p in file_paths_string.split(',')]:
         flash('File not found in the associated clip.', 'error')
         return redirect(url_for('view_clip', key=key))
@@ -247,7 +330,6 @@ def download_file(file_path):
         return redirect(url_for('index'))
     
     
-    # Use original filename for download name
     filename_with_key = os.path.basename(file_path)
     original_filename = filename_with_key.split('_', 2)[-1] 
     
@@ -257,16 +339,15 @@ def download_file(file_path):
                                download_name=original_filename)
 
 if __name__ == '__main__':
-    # This block is not used in Gunicorn mode, but is kept for completeness
     pass
 
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The new Admin/Create Tool)
+# 4. Create clipboard_cli.py (The CLI Management Tool - NO CHANGE)
 # ============================================
-print_status "4/6: Creating clipboard_cli.py (New CLI Management Tool)..."
-# The content of clipboard_cli.py is the same as V22, but we include it here for completeness
+print_status "4/6: Creating clipboard_cli.py (CLI Management Tool - No Change)..."
+# We re-create it just to ensure its existence, its content is the same as V23
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -279,7 +360,6 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv, find_dotenv
 
 # --- Configuration & Init ---
-# Attempt to load .env from the expected path
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
@@ -361,7 +441,7 @@ def cleanup_expired_clips():
 # --- Main CLI Functions ---
 
 def create_new_clip():
-    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip ---{Color.END}")
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip (CLI){Color.END}")
     content = input("Enter text content (leave empty if only creating a placeholder): ").strip()
     custom_key = input("Enter custom link key (optional, leave empty for random): ").strip()
 
@@ -553,7 +633,6 @@ def main_menu():
     init_db()
     cleanup_expired_clips()
     
-    # Check if this is being called from the installer as a one-off task
     if len(sys.argv) > 1 and sys.argv[1] == '--init-db':
         print(f"[{Color.GREEN}INFO{Color.END}] Database checked/initialized successfully.")
         return
@@ -590,33 +669,80 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (For web_service.py)
+# 5. Create Minimal Templates (Full Web Submission Form)
 # ============================================
-print_status "5/6: Creating minimal HTML templates for web view..."
+print_status "5/6: Creating HTML templates (Web Submission Form)..."
 
-# --- index.html (Just a welcome page) ---
+# --- index.html (FULL SUBMISSION FORM) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Internet Clipboard Server</title>
+    <title>Internet Clipboard Server - Create</title>
     <style>
-        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
-        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1 { color: #007bff; margin-bottom: 20px; }
-        p { font-size: 1.1em; color: #555; }
-        .cli-note { margin-top: 30px; padding: 15px; background-color: #ffeeba; border: 1px solid #ffcc00; border-radius: 8px; color: #856404; font-weight: bold; }
+        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 700px; margin: 20px auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
+        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        form div { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        textarea, input[type="text"], input[type="file"] { 
+            width: 100%; 
+            padding: 10px; 
+            box-sizing: border-box; 
+            border: 1px solid #ccc; 
+            border-radius: 6px;
+        }
+        textarea { height: 120px; resize: vertical; }
+        input[type="submit"] {
+            background-color: #5cb85c;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            transition: background-color 0.3s;
+        }
+        input[type="submit"]:hover { background-color: #4cae4c; }
+        .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📋 Internet Clipboard Server</h1>
-        <p>This server is running in Light Mode.</p>
+        <h1>📋 Internet Clipboard Server (Create Clip)</h1>
+        
+        <div class="flash error">
+            {% for message in get_flashed_messages(category_filter=['error']) %}
+                {{ message }}
+            {% endfor %}
+        </div>
+        
+        <form method="POST" enctype="multipart/form-data">
+            <div>
+                <label for="content">Text Content (Optional):</label>
+                <textarea id="content" name="content" placeholder="Paste your text here..."></textarea>
+            </div>
+            
+            <div>
+                <label for="files">Upload Files (Optional - Max 50MB):</label>
+                <input type="file" id="files" name="files" multiple>
+            </div>
+            
+            <div>
+                <label for="custom_key">Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
+                <input type="text" id="custom_key" name="custom_key" placeholder="Leave empty for a random key">
+            </div>
+            
+            <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
+        </form>
+        
         <div class="cli-note">
-            To create or manage clips (text or files), you must connect to the server via SSH and use the Command Line Interface (CLI) tool:
-            <br>
+            ⚠️ The Admin Panel is only available via the Command Line Interface (CLI) on the server. 
+            Connect via SSH and run: 
             <code>sudo /opt/clipboard_server/venv/bin/python3 /opt/clipboard_server/clipboard_cli.py</code>
         </div>
     </div>
@@ -624,7 +750,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (Same as before, only for viewing data) ---
+# --- clipboard.html (Remains the same for viewing - ensure it's present) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -695,7 +821,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         {% endif %}
 
         <div class="back-link">
-            <a href="/">← Go to Home</a>
+            <a href="/">← Create New Clip</a>
         </div>
     </div>
 
@@ -713,7 +839,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# --- error.html (New simple error page) ---
+# --- error.html (Same as V23) ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -742,22 +868,22 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 </html>
 ERROREOF
 
+
 # ============================================
 # 6. Create Systemd Service (Single Service for Web View)
 # ============================================
-print_status "6/7: Creating Systemd service for light web view..."
+print_status "6/7: Creating Systemd service for web server..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Web Viewer (Light Mode)
+Description=Flask Clipboard Web Server (Full Submission, CLI Management)
 After=network.target
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# ExecStart now runs the minimal web_service.py
 ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -774,7 +900,6 @@ SERVICEEOF
 print_status "7/7: Initializing Database and starting service..."
 
 # Initialize DB using the venv Python, ensuring the database file and table exist BEFORE Gunicorn starts
-# We use the special --init-db flag to prevent the CLI menu from appearing during installation
 "$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py" --init-db 
 
 systemctl daemon-reload
@@ -783,15 +908,14 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V23 - Final Stable CLI/Light Mode)"
+echo "🎉 Installation Complete (Clipboard Server V24 - Web Submission & CLI Management)"
 echo "================================================"
 echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
-echo "🌐 CLIPBOARD URL (View Only): http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 CREATE CLIP (Web Interface): http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 ADMIN/CREATION: Use the Command Line Interface (CLI)!"
+echo "💻 ADMIN/MANAGEMENT (CLI Only):"
 echo -e "   ${BLUE}sudo ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py${NC}"
 echo "------------------------------------------------"
-echo "Status:   sudo systemctl status clipboard.service"
 echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
