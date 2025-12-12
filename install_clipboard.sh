@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V29 - FINAL STABILITY FIX: Single Worker (V27) + No immediate cleanup (V28) + Improved CLI execution path.
+# V31 - FINAL FIX: Standardized Expiry using UNIX Timestamps in DB to eliminate Timezone conflicts.
 
 set -e
 
@@ -24,18 +24,18 @@ print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 # Check root access
 if [ "$EUID" -ne 0 ]; then
-    print_error "❌ لطفاً اسکریپت را با دسترسی root اجرا کنید: sudo bash install_clipboard.sh"
+    print_error "❌ Please run the script with root access: sudo bash install_clipboard.sh"
     exit 1
 fi
 
 echo "=================================================="
-echo "📋 نصب‌کننده سرور کلیپ‌بورد اینترنتی (V29 - رفع نهایی پایداری)"
+echo "📋 Internet Clipboard Server Installer (V31 - Final Stability)"
 echo "=================================================="
 
 # ============================================
 # 1. System Setup & Venv
 # ============================================
-print_status "1/6: آماده‌سازی سیستم و محیط مجازی..."
+print_status "1/6: Preparing system and virtual environment..."
 apt update -y
 apt install -y python3 python3-pip python3-venv curl wget
 
@@ -63,11 +63,10 @@ deactivate
 # ============================================
 # 2. Update .env and Directories
 # ============================================
-print_status "2/6: به‌روزرسانی پیکربندی و ساختار دایرکتوری..."
+print_status "2/6: Updating configuration and directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
-# تنظیم دسترسی کامل برای اطمینان از رفع مشکل Permissions
 chmod -R 777 "$INSTALL_DIR" 
 
 # --- Create .env file ---
@@ -80,15 +79,16 @@ DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 ENVEOF
 
 # ============================================
-# 3. Create web_service.py (V29: Improved DB connection logic)
+# 3. Create web_service.py (V31: Timestamp Expiry)
 # ============================================
-print_status "3/6: ساخت web_service.py (V29 - رفع خطای خواندن)..."
+print_status "3/6: Creating web_service.py (V31 - Timestamp Expiry Fix)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
 import re
 import string
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
@@ -113,8 +113,7 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
-            # V29: Using URI mode and check_same_thread=False for robustness.
-            # Gunicorn is forced to 1 worker to eliminate concurrency locks.
+            # Using URI mode and check_same_thread=False for robustness (Gunicorn forced to 1 worker)
             db = g._database = sqlite3.connect(
                 f'file:{DATABASE_PATH}?mode=rw', 
                 uri=True, 
@@ -122,10 +121,9 @@ def get_db():
                 check_same_thread=False 
             )
             db.row_factory = sqlite3.Row 
-            db.execute('PRAGMA journal_mode=WAL') # Ensure WAL mode is active
+            db.execute('PRAGMA journal_mode=WAL') 
             db.execute('PRAGMA foreign_keys=ON') 
         except sqlite3.OperationalError as e:
-            # This block helps diagnose DB path/permission issues on first run
             print(f"[FATAL] Could not connect to database at {DATABASE_PATH}: {e}")
             raise RuntimeError("Database connection failed.")
     return db
@@ -154,10 +152,10 @@ def generate_key(length=8):
 def cleanup_expired_clips():
     db = get_db()
     cursor = db.cursor()
-    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    now_ts = int(time.time()) # Current UNIX timestamp
 
     # Delete associated files
-    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
+    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
     expired_files = cursor.fetchall()
 
     for file_path_tuple in expired_files:
@@ -171,7 +169,7 @@ def cleanup_expired_clips():
                     print(f"[WARNING] Error removing file {full_path}: {e}")
             
     # Delete database entries
-    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
+    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     db.commit()
 
 # --- Main Routes ---
@@ -188,14 +186,14 @@ def index():
         has_content = content or any(f.filename for f in uploaded_files)
         
         if not has_content:
-            flash('لطفاً محتوای متنی ارائه دهید یا حداقل یک فایل آپلود کنید.', 'error')
+            flash('Please provide text content or upload at least one file.', 'error')
             return redirect(url_for('index'))
 
         key = custom_key or generate_key()
         
         # Validate key
         if custom_key and not re.match(KEY_REGEX, custom_key):
-            flash('فرمت کلید سفارشی نامعتبر است.', 'error')
+            flash('Invalid custom key format.', 'error')
             return redirect(url_for('index'))
             
         # Check for key existence
@@ -204,13 +202,13 @@ def index():
             cursor = db.cursor()
             cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
             if cursor.fetchone():
-                flash(f'کلید "{key}" قبلاً استفاده شده است. لطفاً کلید دیگری انتخاب کنید.', 'error')
+                flash(f'The key "{key}" is already in use. Please choose another key.', 'error')
                 return redirect(url_for('index'))
         except RuntimeError:
-            flash("خطای اتصال پایگاه داده.", 'error')
+            flash("Database connection error.", 'error')
             return redirect(url_for('index'))
             
-        # File Handling (Same as V28)
+        # File Handling
         file_paths = []
         try:
             for file in uploaded_files:
@@ -221,24 +219,24 @@ def index():
                     file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
                     file_paths.append(full_path)
                 elif file.filename and not allowed_file(file.filename):
-                     flash(f'نوع فایل مجاز نیست: {file.filename}', 'error')
+                     flash(f'File type not allowed: {file.filename}', 'error')
                      return redirect(url_for('index'))
                      
         except Exception as e:
-            flash(f'خطای آپلود فایل: {e}', 'error')
+            flash(f'File upload error: {e}', 'error')
             for fp in file_paths:
                 try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
                 except: pass
             return redirect(url_for('index'))
             
-        # Database Insertion
-        expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
+        # Database Insertion (V31: Use UNIX Timestamps for Expiry)
+        expires_at_ts = int(time.time() + (EXPIRY_DAYS * 24 * 3600))
         file_path_string = ','.join(file_paths)
         
         try:
             cursor.execute(
                 "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (key, content, file_path_string, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+                (key, content, file_path_string, int(time.time()), expires_at_ts)
             )
             db.commit()
             
@@ -247,47 +245,50 @@ def index():
             
         except sqlite3.OperationalError as e:
              print(f"SQLITE ERROR: {e}")
-             flash("خطای پایگاه داده هنگام ایجاد کلیپ. لاگ‌های سرور را بررسی کنید.", 'error')
+             flash("Database error during clip creation. Check server logs.", 'error')
              return redirect(url_for('index'))
 
 
     # 2. Handle GET request (Display form)
-    # Cleanup runs here on page load, NOT after form submission
     try:
         cleanup_expired_clips()
     except RuntimeError:
-         flash("خطای اتصال به پایگاه داده در هنگام تمیزکاری. لطفاً CLI را اجرا کنید.", 'error')
+         flash("Database connection error during cleanup. Please run CLI tool.", 'error')
     
     return render_template('index.html', EXPIRY_DAYS=EXPIRY_DAYS)
 
 
 @app.route('/<key>')
 def view_clip(key):
+    # V31: Read timestamp directly
     try:
-        cleanup_expired_clips()
         db = get_db()
         cursor = db.cursor()
         cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
         clip = cursor.fetchone()
     except RuntimeError:
-        return render_template('error.html', message="خطای پایگاه داده. پایگاه داده را توسط CLI بررسی کنید."), 500
+        return render_template('error.html', message="Database error. Check the database using the CLI."), 500
     except sqlite3.OperationalError as e:
         print(f"SQLITE ERROR: {e}")
-        return render_template('error.html', message="پایگاه داده راه‌اندازی نشده یا خراب است. ابزار CLI را اجرا کنید."), 500
+        return render_template('error.html', message="Database uninitialized or corrupted. Run the CLI tool."), 500
 
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
 
-    content, file_path_string, expires_at_str = clip
+    content, file_path_string, expires_at_ts = clip
     
-    expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-    now_utc = datetime.now(timezone.utc)
+    now_ts = int(time.time())
     
-    if expires_at < now_utc:
+    if expires_at_ts < now_ts:
+        # If the clip is found but expired, run cleanup and return expired message
         cleanup_expired_clips()
         return render_template('clipboard.html', clip=None, key=key, expired=True)
 
-    time_left = expires_at - now_utc
+    # Calculate time left using datetime objects for display purposes
+    expires_at_dt = datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    
+    time_left = expires_at_dt - now_dt
     days = time_left.days
     hours = time_left.seconds // 3600
     minutes = (time_left.seconds % 3600) // 60
@@ -317,16 +318,15 @@ def view_clip(key):
 
 @app.route('/download/<path:file_path>')
 def download_file(file_path):
-    # Same as V28
     if not file_path.startswith(UPLOAD_FOLDER + '/'):
-         flash('درخواست دانلود نامعتبر.', 'error')
+         flash('Invalid download request.', 'error')
          return redirect(url_for('index'))
          
     filename_part = os.path.basename(file_path)
     try:
         key = filename_part.split('_', 1)[0]
     except IndexError:
-        flash('فرمت مسیر فایل نامعتبر است.', 'error')
+        flash('Invalid file path format.', 'error')
         return redirect(url_for('index'))
 
     db = get_db()
@@ -335,20 +335,19 @@ def download_file(file_path):
     clip = cursor.fetchone()
 
     if not clip:
-        flash('فایل یافت نشد یا لینک منقضی شده است.', 'error')
+        flash('File not found or link expired.', 'error')
         return redirect(url_for('index'))
 
-    file_paths_string, expires_at_str = clip
+    file_paths_string, expires_at_ts = clip
     
     if file_path not in [p.strip() for p in file_paths_string.split(',')]:
-        flash('فایل در کلیپ مرتبط یافت نشد.', 'error')
+        flash('File not found in the associated clip.', 'error')
         return redirect(url_for('view_clip', key=key))
 
 
-    expires_at = datetime.strptime(expires_at_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
+    if expires_at_ts < int(time.time()):
         cleanup_expired_clips()
-        flash('فایل یافت نشد یا لینک منقضی شده است.', 'error')
+        flash('File not found or link expired.', 'error')
         return redirect(url_for('index'))
     
     
@@ -366,9 +365,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V29: Simplified path)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V31: Timestamp Expiry)
 # ============================================
-print_status "4/6: ساخت clipboard_cli.py (ابزار CLI - مسیر اجرای ساده‌تر)..."
+print_status "4/6: Creating clipboard_cli.py (CLI Tool - Timestamp Expiry Fix)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -376,12 +375,12 @@ import random
 import string
 import re
 import sys
+import time
 import argparse
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv, find_dotenv
 
 # --- Configuration & Init ---
-# Load .env relative to the script location
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
@@ -406,7 +405,6 @@ class Color:
 
 # --- Database Management ---
 def get_db_connection():
-    # CLI tool is single-threaded, so standard connection is fine here
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -414,17 +412,17 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    # V31: Change created_at and expires_at storage to INTEGER (UNIX Timestamp)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY,
             key TEXT UNIQUE NOT NULL,
             content TEXT,
             file_path TEXT, 
-            created_at DATETIME NOT NULL,
-            expires_at DATETIME NOT NULL
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
         )
     """)
-    # Set WAL mode for CLI as well for better compatibility
     cursor.execute('PRAGMA journal_mode=WAL')
     conn.commit()
     conn.close()
@@ -444,9 +442,9 @@ def generate_key(length=8):
 def cleanup_expired_clips():
     conn = get_db_connection()
     cursor = conn.cursor()
-    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    now_ts = int(time.time()) # Current UNIX timestamp
 
-    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_utc,))
+    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
     expired_files = cursor.fetchall()
 
     for file_path_tuple in expired_files:
@@ -459,28 +457,28 @@ def cleanup_expired_clips():
                 except OSError as e:
                     print(f"[{Color.YELLOW}WARNING{Color.END}] Error removing file {full_path}: {e}")
             
-    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_utc,))
+    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     conn.commit()
     conn.close()
 
 # --- Main CLI Functions ---
 
 def create_new_clip():
-    print(f"\n{Color.BLUE}{Color.BOLD}--- ایجاد کلیپ جدید (CLI){Color.END}")
-    content = input("محتوای متنی را وارد کنید (اگر فقط Placeholder می‌سازید، خالی بگذارید): ").strip()
-    custom_key = input("کلید لینک سفارشی را وارد کنید (اختیاری، برای کلید تصادفی خالی بگذارید): ").strip()
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Create New Clip (CLI) ---{Color.END}")
+    content = input("Enter text content (leave blank for placeholder): ").strip()
+    custom_key = input("Enter custom link key (optional, leave blank for random): ").strip()
 
     key = None
     if custom_key:
         if not re.match(KEY_REGEX, custom_key):
-            print(f"{Color.RED}خطا: کلید سفارشی نامعتبر است.{Color.END}")
+            print(f"{Color.RED}Error: Invalid custom key.{Color.END}")
             return
         
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM clips WHERE key = ?", (custom_key,))
         if cursor.fetchone():
-            print(f"{Color.RED}خطا: کلید '{custom_key}' قبلاً گرفته شده است.{Color.END}")
+            print(f"{Color.RED}Error: Key '{custom_key}' is already taken.{Color.END}")
             conn.close()
             return
         key = custom_key
@@ -489,29 +487,33 @@ def create_new_clip():
         key = generate_key()
 
     if not content:
-        content = f"کلیپ خالی توسط CLI ایجاد شد. کلید: {key}"
+        content = f"Empty clip created by CLI. Key: {key}"
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=EXPIRY_DAYS)
+    # V31: Use UNIX Timestamps
+    created_at_ts = int(time.time())
+    expires_at_ts = int(created_at_ts + (EXPIRY_DAYS * 24 * 3600))
+    expires_at_dt = datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
+
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO clips (key, content, file_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (key, content, "", datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), expires_at.strftime('%Y-%m-%d %H:%M:%S'))
+            (key, content, "", created_at_ts, expires_at_ts)
         )
         conn.commit()
         conn.close()
         
-        print(f"\n{Color.GREEN}✅ موفقیت! کلیپ ایجاد شد:{Color.END}")
-        print(f"   {Color.BOLD}کلید:{Color.END} {key}")
-        print(f"   {Color.BOLD}لینک:{Color.END} {BASE_URL}/{key}")
-        print(f"   {Color.BOLD}انقضا:{Color.END} {expires_at.strftime('%Y-%m-%d %H:%M:%S')} (در {EXPIRY_DAYS} روز)")
+        print(f"\n{Color.GREEN}✅ Success! Clip created:{Color.END}")
+        print(f"   {Color.BOLD}Key:{Color.END} {key}")
+        print(f"   {Color.BOLD}Link:{Color.END} {BASE_URL}/{key}")
+        print(f"   {Color.BOLD}Expires:{Color.END} {expires_at_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (in {EXPIRY_DAYS} days)")
         
     except sqlite3.Error as e:
-        print(f"{Color.RED}خطای پایگاه داده: {e}{Color.END}")
+        print(f"{Color.RED}Database Error: {e}{Color.END}")
     except Exception as e:
-        print(f"{Color.RED}خطای غیرمنتظره‌ای رخ داد: {e}{Color.END}")
+        print(f"{Color.RED}An unexpected error occurred: {e}{Color.END}")
 
 
 def list_clips():
@@ -523,28 +525,32 @@ def list_clips():
     conn.close()
 
     if not clips:
-        print(f"\n{Color.YELLOW}کلیپ فعالی یافت نشد.{Color.END}")
+        print(f"\n{Color.YELLOW}No active clips found.{Color.END}")
         return
 
-    print(f"\n{Color.BLUE}{Color.BOLD}--- کلیپ‌های فعال ({len(clips)}) ---{Color.END}")
-    print(f"{Color.CYAN}{'ID':<4} {'کلید':<20} {'پیش نمایش محتوا':<40} {'فایل‌ها':<10} {'انقضا':<10}{Color.END}")
-    print("-" * 90)
+    print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
+    print(f"{Color.CYAN}{'ID':<4} {'Key':<20} {'Content Preview':<40} {'Files':<10} {'Expires (UTC)':<20}{Color.END}")
+    print("-" * 96)
     
     for clip in clips:
-        content_preview = (clip['content'][:35] + '...') if clip['content'] and len(clip['content']) > 35 else (clip['content'] or "بدون محتوا")
+        content_preview = (clip['content'][:35] + '...') if clip['content'] and len(clip['content']) > 35 else (clip['content'] or "No content")
         file_count = len([p for p in clip['file_path'].split(',') if p.strip()]) if clip['file_path'] else 0
         
-        print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<20}{Color.END} {content_preview:<40} {file_count:<10} {clip['expires_at'].split(' ')[0]:<10}")
-    print("-" * 90)
+        # Display expiration date from timestamp
+        expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
+        expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<20}{Color.END} {content_preview:<40} {file_count:<10} {expiry_date_utc:<20}")
+    print("-" * 96)
 
 
 def delete_clip():
     list_clips()
-    if not input(f"\n{Color.YELLOW}آیا با حذف ادامه می‌دهید؟ (بله/خیر): {Color.END}").lower().strip().startswith('ب'):
-        print("حذف لغو شد.")
+    if not input(f"\n{Color.YELLOW}Do you want to continue with deletion? (yes/no): {Color.END}").lower().strip().startswith('y'):
+        print("Deletion cancelled.")
         return
 
-    clip_id_or_key = input("ID یا کلید کلیپ برای حذف را وارد کنید: ").strip()
+    clip_id_or_key = input("Enter the ID or Key of the clip to delete: ").strip()
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -557,7 +563,7 @@ def delete_clip():
     clip = cursor.fetchone()
     
     if not clip:
-        print(f"{Color.RED}خطا: کلیپ با ID/Key '{clip_id_or_key}' یافت نشد.{Color.END}")
+        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
         conn.close()
         return
 
@@ -570,18 +576,18 @@ def delete_clip():
             full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
             if os.path.exists(full_path):
                 os.remove(full_path)
-                print(f" - فایل حذف شد: {os.path.basename(file_path)}")
+                print(f" - File deleted: {os.path.basename(file_path)}")
                 
     cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
     conn.commit()
     conn.close()
     
-    print(f"\n{Color.GREEN}✅ کلیپ با ID {clip_id} (کلید: {clip_key}) با موفقیت حذف شد.{Color.END}")
+    print(f"\n{Color.GREEN}✅ Clip ID {clip_id} (Key: {clip_key}) successfully deleted.{Color.END}")
 
 
 def edit_clip():
     list_clips()
-    clip_id_or_key = input("\nID یا کلید کلیپ برای ویرایش را وارد کنید: ").strip()
+    clip_id_or_key = input("\nEnter the ID or Key of the clip to edit: ").strip()
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -594,45 +600,45 @@ def edit_clip():
     clip = cursor.fetchone()
     
     if not clip:
-        print(f"{Color.RED}خطا: کلیپ با ID/Key '{clip_id_or_key}' یافت نشد.{Color.END}")
+        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
         conn.close()
         return
 
     clip_id = clip['id']
     clip_key = clip['key']
 
-    print(f"\n{Color.CYAN}--- ویرایش کلیپ ID {clip_id} (کلید: {clip_key}) ---{Color.END}")
-    print(f"کلید فعلی: {Color.BOLD}{clip_key}{Color.END}")
+    print(f"\n{Color.CYAN}--- Edit Clip ID {clip_id} (Key: {clip_key}) ---{Color.END}")
+    print(f"Current Key: {Color.BOLD}{clip_key}{Color.END}")
     print("--------------------------------------------------")
-    print(f"1. ویرایش کلید")
-    print(f"2. ویرایش محتوا")
-    print(f"0. لغو")
+    print(f"1. Edit Key")
+    print(f"2. Edit Content")
+    print(f"0. Cancel")
     
-    choice = input("انتخاب خود را وارد کنید (1/2/0): ").strip()
+    choice = input("Enter your choice (1/2/0): ").strip()
 
     if choice == '1':
-        new_key = input(f"کلید جدید را وارد کنید (فعلی: {clip_key}): ").strip()
+        new_key = input(f"Enter new key (Current: {clip_key}): ").strip()
         if not new_key or not re.match(KEY_REGEX, new_key):
-            print(f"{Color.RED}خطا: کلید نامعتبر یا خالی.{Color.END}")
+            print(f"{Color.RED}Error: Invalid or empty key.{Color.END}")
             conn.close()
             return
         
         if new_key != clip_key:
             cursor.execute("SELECT 1 FROM clips WHERE key = ? AND id != ?", (new_key, clip_id))
             if cursor.fetchone():
-                print(f"{Color.RED}خطا: کلید '{new_key}' قبلاً گرفته شده است.{Color.END}")
+                print(f"{Color.RED}Error: Key '{new_key}' is already taken.{Color.END}")
                 conn.close()
                 return
         
         cursor.execute("UPDATE clips SET key = ? WHERE id = ?", (new_key, clip_id))
         conn.commit()
-        print(f"\n{Color.GREEN}✅ کلید با موفقیت به {new_key} به‌روزرسانی شد.{Color.END}")
+        print(f"\n{Color.GREEN}✅ Key successfully updated to {new_key}.{Color.END}")
         
     elif choice == '2':
-        print(f"\n{Color.YELLOW}--- محتوای فعلی ---{Color.END}")
-        print(clip['content'] if clip['content'] else "(خالی)")
+        print(f"\n{Color.YELLOW}--- Current Content ---{Color.END}")
+        print(clip['content'] if clip['content'] else "(Empty)")
         print("---------------------------------------")
-        print(f"محتوای جدید را تایپ کنید. برای ذخیره و پایان، {Color.BOLD}Ctrl+D{Color.END} (یا Ctrl+Z در ویندوز)، سپس Enter را فشار دهید.")
+        print(f"Type new content. Press {Color.BOLD}Ctrl+D{Color.END} (or Ctrl+Z on Windows), then Enter, to save and finish.")
         
         content_lines = []
         try:
@@ -647,10 +653,10 @@ def edit_clip():
             
         cursor.execute("UPDATE clips SET content = ? WHERE id = ?", (new_content, clip_id))
         conn.commit()
-        print(f"\n{Color.GREEN}✅ محتوا با موفقیت به‌روزرسانی شد.{Color.END}")
+        print(f"\n{Color.GREEN}✅ Content successfully updated.{Color.END}")
     
     elif choice == '0':
-        print("ویرایش لغو شد.")
+        print("Editing cancelled.")
 
     conn.close()
 
@@ -660,20 +666,20 @@ def main_menu():
     
     # Check if run with the init-db flag
     if len(sys.argv) > 1 and sys.argv[1] == '--init-db':
-        print(f"[{Color.GREEN}INFO{Color.END}] پایگاه داده با موفقیت بررسی/راه‌اندازی اولیه شد.")
+        print(f"[{Color.GREEN}INFO{Color.END}] Database successfully checked/initialized.")
         return
 
     while True:
         print(f"\n{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
-        print(f"{Color.PURPLE}{Color.BOLD}   مدیریت CLI کلیپ‌بورد (URL پایه: {BASE_URL}){Color.END}")
+        print(f"{Color.PURPLE}{Color.BOLD}   Clipboard CLI Management (Base URL: {BASE_URL}){Color.END}")
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
-        print(f"1. {Color.GREEN}ایجاد کلیپ جدید{Color.END} (فقط متن)")
-        print(f"2. {Color.BLUE}لیست تمام کلیپ‌ها{Color.END}")
-        print(f"3. {Color.CYAN}ویرایش کلیپ{Color.END} (کلید یا محتوا)")
-        print(f"4. {Color.RED}حذف کلیپ{Color.END}")
-        print("0. خروج")
+        print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
+        print(f"2. {Color.BLUE}List All Clips{Color.END}")
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key or Content)")
+        print(f"4. {Color.RED}Delete Clip{Color.END}")
+        print("0. Exit")
         
-        choice = input("انتخاب خود را وارد کنید: ").strip()
+        choice = input("Enter your choice: ").strip()
 
         if choice == '1':
             create_new_clip()
@@ -684,10 +690,10 @@ def main_menu():
         elif choice == '4':
             delete_clip()
         elif choice == '0':
-            print(f"\n{Color.BOLD}خروج از مدیریت CLI. خداحافظ!{Color.END}")
+            print(f"\n{Color.BOLD}Exiting CLI Management. Goodbye!{Color.END}")
             break
         else:
-            print(f"{Color.RED}انتخاب نامعتبر است. لطفاً دوباره تلاش کنید.{Color.END}")
+            print(f"{Color.RED}Invalid choice. Please try again.{Color.END}")
 
 if __name__ == '__main__':
     main_menu()
@@ -697,18 +703,18 @@ PYEOF_CLI_TOOL
 # ============================================
 # 5. Create Minimal Templates (NO CHANGE)
 # ============================================
-print_status "5/6: ساخت قالب‌های HTML..."
+print_status "5/6: Creating HTML templates..."
 
 # --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Internet Clipboard Server - Create</title>
     <style>
-        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
         .container { max-width: 700px; margin: 20px auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
         h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
         .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
@@ -778,20 +784,20 @@ INDEXEOF
 # --- clipboard.html ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clip: {{ key }}</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
         .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
         h1 { color: #007bff; text-align: center; margin-bottom: 20px; }
         pre { background-color: #eee; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; overflow: auto; max-height: 400px; margin-bottom: 20px; border: 1px solid #ccc; position: relative; }
         .content-section { margin-bottom: 30px; }
         .files-section { margin-bottom: 30px; border-top: 1px solid #eee; padding-top: 20px; }
         .files-section h2 { color: #333; font-size: 1.2em; margin-bottom: 15px; }
-        .file-item { display: flex; justify-content: space-between; align-items: center; background-color: #f0f8ff; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px; border-left: 5px solid #007bff; }
+        .file-item { display: flex; justify-content: space-between; align-items: center; background-color: #f0f8ff; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px; border-right: 5px solid #007bff; }
         .file-item a { color: #007bff; text-decoration: none; font-weight: bold; }
         .file-item a:hover { text-decoration: underline; }
         .expiry-info { text-align: center; color: #d9534f; font-weight: bold; margin-bottom: 20px; }
@@ -799,7 +805,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         .back-link a { color: #007bff; text-decoration: none; font-weight: bold; }
         .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
         .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: right; margin-left: 10px; }
+        .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: left; margin-right: 10px; }
         .copy-button:hover { background-color: #4cae4c; }
     </style>
 </head>
@@ -867,13 +873,13 @@ CLIPBOARDEOF
 # --- error.html ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Error</title>
     <style>
-        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
         .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
         h1 { color: #dc3545; margin-bottom: 20px; }
         p { font-size: 1.1em; color: #555; }
@@ -897,7 +903,7 @@ ERROREOF
 # ============================================
 # 6. Create Systemd Service (Workers set to 1)
 # ============================================
-print_status "6/7: ساخت سرویس Systemd برای وب سرور (کارگر: ۱)..."
+print_status "6/7: Creating Systemd service for web server (Workers: 1)..."
 
 # --- clipboard.service (Port 3214 - Runs web_service.py) ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
@@ -909,7 +915,6 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# FIXED: Workers set to 1 to eliminate all SQLite locking issues.
 ExecStart=${GUNICORN_VENV_PATH} --workers 1 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
@@ -923,9 +928,9 @@ SERVICEEOF
 # ============================================
 # 7. Final Steps
 # ============================================
-print_status "7/7: راه‌اندازی پایگاه داده و شروع سرویس..."
+print_status "7/7: Initializing database and starting service..."
 
-# ایجاد یک اسکریپت ساده برای اجرای CLI که دسترسی محیط مجازی را مدیریت کند
+# Create a simple wrapper script for CLI execution
 cat > "$INSTALL_DIR/clipboard_cli.sh" << CLISHEOF
 #!/bin/bash
 source ${INSTALL_DIR}/venv/bin/activate
@@ -942,14 +947,14 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V29 - پایدار)"
+echo "🎉 Installation complete (Clipboard Server V31 - Final Stable)"
 echo "================================================"
-echo "✅ وضعیت سرویس وب (پورت ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
+echo "✅ Web Service Status (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
-echo "🌐 ایجاد کلیپ (واسط وب): http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 Create Clip (Web Interface): http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 مدیریت/ادمین (فقط CLI):"
+echo "💻 Admin/Management (CLI Only):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
-echo "لاگ‌ها:     sudo journalctl -u clipboard.service -f"
+echo "Logs:     sudo journalctl -u clipboard.service -f"
 echo "================================================"
