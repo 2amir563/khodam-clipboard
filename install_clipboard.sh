@@ -126,7 +126,7 @@ def get_db():
                 DATABASE_PATH, 
                 timeout=10, 
                 check_same_thread=False,
-                isolation_level=None # Critical for autocommit/explicit control
+                isolation_level=None 
             )
             db.row_factory = sqlite3.Row 
             db.execute('PRAGMA foreign_keys=ON') 
@@ -271,8 +271,6 @@ def view_clip(key):
     try:
         db = get_db()
         cursor = db.cursor()
-        # V33: Adding a small delay might help flush cache in extreme high concurrency, but commit should fix it.
-        # time.sleep(0.05) 
         cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
         clip = cursor.fetchone()
     except RuntimeError:
@@ -952,14 +950,14 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation complete (Clipboard Server V33 - Final Stable)"
+echo "🎉 نصب کامل شد (Clipboard Server V33 - پایدار نهایی)"
 echo "================================================"
-echo "✅ Web Service Status (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
+echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است."
 echo "------------------------------------------------"
-echo "🌐 Create Clip (Web Interface): http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 آدرس وب: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 Admin/Management (CLI Only):"
+echo "💻 مدیریت CLI (برای لیست/حذف کلیپ‌ها):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
-echo "Logs:     sudo journalctl -u clipboard.service -f"
+echo "Logها:    sudo journalctl -u clipboard.service -f"
 echo "================================================"
