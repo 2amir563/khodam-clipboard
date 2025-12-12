@@ -1,12 +1,12 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (Flask + Gunicorn + SQLite)
-# V17 - FINAL: Multiple Local File Uploads + Merged Admin Panel (Port 3214).
+# V18 - FINAL: Multiple Local File Uploads + Merged Admin Panel (Port 3214) + Forced Password Input + Reset Utility.
 
 set -e
 
 # --- Configuration ---
 INSTALL_DIR="/opt/clipboard_server"
-CLIPBOARD_PORT="3214" # Both services run on this port
+CLIPBOARD_PORT="3214" 
 EXPIRY_DAYS="30"
 SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32) 
 
@@ -14,9 +14,11 @@ SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
+YELLOW='\033[1;33m'
 
 print_status() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 # Check root access
 if [ "$EUID" -ne 0 ]; then
@@ -25,30 +27,41 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V17 - Merged Admin on Port ${CLIPBOARD_PORT})"
+echo "📋 Internet Clipboard Server Installer (V18 - Merged Admin on Port ${CLIPBOARD_PORT})"
 echo "=================================================="
 
 # ============================================
-# 1. Password Input Phase
+# 1. Password Input Phase (FORCED)
 # ============================================
 echo ""
 echo "🛑 SECURITY SETUP: Admin Panel Password"
 echo "------------------------------------------------"
 
-read -s -p "Enter a strong Admin Password for Admin URL: " ADMIN_PASSWORD
-echo ""
-read -s -p "Confirm Admin Password: " ADMIN_PASSWORD_CONFIRM
-echo ""
+# Loop until a valid, matching password is provided
+while true; do
+    read -s -p "Enter a strong Admin Password: " ADMIN_PASSWORD
+    echo ""
+    read -s -p "Confirm Admin Password: " ADMIN_PASSWORD_CONFIRM
+    echo ""
 
-if [ -z "$ADMIN_PASSWORD" ]; then
-    print_error "❌ Password cannot be empty."
-    exit 1
-fi
+    if [ -z "$ADMIN_PASSWORD" ]; then
+        print_error "❌ Password cannot be empty. Please try again."
+        continue
+    fi
 
-if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
-    print_error "❌ Passwords do not match. Installation aborted."
-    exit 1
-fi
+    if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+        print_error "❌ Passwords do not match. Please try again."
+        continue
+    fi
+    
+    # Simple length check to enforce minimum strength
+    if [ ${#ADMIN_PASSWORD} -lt 8 ]; then
+        print_error "❌ Password is too short. It must be at least 8 characters long."
+        continue
+    fi
+
+    break 
+done
 
 echo "------------------------------------------------"
 print_status "Password successfully set."
@@ -65,7 +78,9 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
 
 # Install dependencies needed for password hashing (werkzeug)
-python3 -m venv venv || true 
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+fi
 source venv/bin/activate || true
 
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
@@ -91,7 +106,7 @@ mkdir -p "$INSTALL_DIR/uploads"
 chmod 777 "$INSTALL_DIR/uploads" 
 
 # Hash the password for secure storage
-ADMIN_PASSWORD_HASH=$(echo "$ADMIN_PASSWORD" | $PYTHON_VENV_PATH -c "from werkzeug.security import generate_password_hash; import sys; print(generate_password_hash(sys.stdin.read().strip()))")
+ADMIN_PASSWORD_HASH=$(echo "$ADMIN_PASSWORD" | "$PYTHON_VENV_PATH" -c "from werkzeug.security import generate_password_hash; import sys; print(generate_password_hash(sys.stdin.read().strip()))")
 
 # --- Create .env file ---
 cat > "$INSTALL_DIR/.env" << ENVEOF
@@ -103,10 +118,10 @@ ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 ENVEOF
 
 # ============================================
-# 4. Create app.py (Now includes all routes and Admin logic)
+# 4. Create app.py (Now includes Reset functionality)
 # ============================================
-print_status "4/7: Creating app.py (Including Admin logic and Multi-File support)..."
-cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP_MERGED'
+print_status "4/7: Creating app.py (Including Admin logic, Multi-File, and Reset functionality)..."
+cat > "$INSTALL_DIR/app.py" << 'PYEOF_APP_MERGED_V18'
 import os
 import sqlite3
 import random
@@ -114,15 +129,23 @@ import string
 import re
 import requests
 import urllib.parse
+import sys
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g, session, abort
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key, find_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Load environment variables early
 load_dotenv()
 
 # --- Configuration ---
 app = Flask(__name__)
+# Use absolute path for environment file
+DOTENV_PATH = find_dotenv(usecwd=True)
+if not DOTENV_PATH:
+    # Fallback to current directory if find_dotenv fails
+    DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db')
 UPLOAD_FOLDER = 'uploads'
@@ -165,13 +188,12 @@ def init_db():
 
 # --- Security Decorator: Admin Authentication ---
 def login_required(f):
-    # This decorator checks for admin session before allowing access to admin routes
     def wrap(*args, **kwargs):
         if not session.get('logged_in'):
             flash('Login required to access the admin panel.', 'error')
             return redirect(url_for('admin_login'))
         return f(*args, **kwargs)
-    wrap.__name__ = f.__name__ # Important for Flask routing
+    wrap.__name__ = f.__name__
     return wrap
 
 # --- Helper Functions ---
@@ -187,7 +209,6 @@ def generate_key(length=8):
             return key
 
 def cleanup_expired_clips():
-    # ... (Cleanup logic remains the same)
     db = get_db()
     cursor = db.cursor()
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -210,7 +231,7 @@ def cleanup_expired_clips():
 
 
 def download_remote_file(url, key_prefix, index):
-    """Downloads a single remote file and returns its relative path or an error string."""
+    # ... (Download logic remains the same as V17)
     try:
         with requests.get(url, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -219,7 +240,6 @@ def download_remote_file(url, key_prefix, index):
             if content_length and int(content_length) > MAX_REMOTE_SIZE_BYTES:
                 return "File size exceeds limit."
             
-            # Try to get filename from headers
             filename = f"file_{index}"
             if 'Content-Disposition' in r.headers:
                 filename_header = r.headers['Content-Disposition']
@@ -227,7 +247,6 @@ def download_remote_file(url, key_prefix, index):
                 if match:
                     filename = match.group(1)
             
-            # Fallback to URL path
             if filename == f"file_{index}":
                 path = urllib.parse.urlparse(url).path
                 filename = os.path.basename(path)
@@ -257,14 +276,64 @@ def download_remote_file(url, key_prefix, index):
     except Exception as e:
         return f"An unexpected error occurred: {e}"
 
+# --- Command Line Utility for Password Reset ---
+def reset_admin_password():
+    """Allows admin password reset from command line."""
+    print("\n--- Clipboard Server Admin Password Reset Utility ---")
+    
+    # Check if we are running in the correct environment/directory
+    if not os.path.exists(DOTENV_PATH):
+        print(f"Error: .env file not found at {DOTENV_PATH}")
+        sys.exit(1)
 
-# --- User Routes ---
+    while True:
+        try:
+            new_password = input("Enter new admin password: ")
+            confirm_password = input("Confirm new admin password: ")
+
+            if not new_password:
+                print("Password cannot be empty. Try again.")
+                continue
+
+            if new_password != confirm_password:
+                print("Passwords do not match. Try again.")
+                continue
+            
+            if len(new_password) < 8:
+                print("Password is too short. It must be at least 8 characters long.")
+                continue
+
+            break
+        except EOFError:
+            print("\nReset cancelled.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"An unexpected input error occurred: {e}")
+            sys.exit(1)
+
+    # Hash the new password
+    new_hash = generate_password_hash(new_password)
+    
+    # Save the new hash to the .env file
+    try:
+        success = set_key(DOTENV_PATH, "ADMIN_PASSWORD_HASH", new_hash)
+        if success:
+            print("\n✅ Admin password hash updated successfully in .env file.")
+            print("⚠️ REMINDER: You must restart the clipboard service for changes to take effect.")
+            print("   Command: sudo systemctl restart clipboard.service")
+        else:
+            print("\n❌ Failed to update the .env file. Check file permissions.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Error saving to .env file: {e}")
+        sys.exit(1)
+
+# --- Flask Routes (Same as V17) ---
 
 @app.route('/')
 def index():
     cleanup_expired_clips()
     
-    # ... (Flash message handling for form data remains the same)
     old_data = {}
     messages = list(request.args.get('flash_messages', '').split('||')) 
     display_messages = []
@@ -294,12 +363,12 @@ def index():
 @app.route('/create', methods=['POST'])
 def create_clip():
     content = request.form.get('content')
-    uploaded_files = request.files.getlist('files[]') # Changed from 'file' to 'files[]'
+    uploaded_files = request.files.getlist('files[]')
     remote_urls_input = request.form.get('remote_urls', '').strip()
     custom_key = request.form.get('custom_key', '').strip()
 
     is_content_empty = not content
-    is_local_files_empty = not any(f.filename for f in uploaded_files) # Check if any file was uploaded
+    is_local_files_empty = not any(f.filename for f in uploaded_files)
     is_remote_urls_empty = not remote_urls_input
 
     if is_content_empty and is_local_files_empty and is_remote_urls_empty:
@@ -309,7 +378,6 @@ def create_clip():
     form_data_for_flash = {'content': content, 'custom_key': custom_key, 'remote_urls': remote_urls_input}
     error_messages = []
 
-    # 1. Key determination and validation
     key = None
     if custom_key:
         if not re.match(KEY_REGEX, custom_key):
@@ -331,21 +399,18 @@ def create_clip():
 
     file_paths_list = []
     
-    # 2. Handle multiple local file uploads
     remote_index_start = 0
     if uploaded_files:
         for i, uploaded_file in enumerate(uploaded_files):
             if uploaded_file and uploaded_file.filename:
                 filename = uploaded_file.filename
-                # Use a combined index for uniqueness
                 file_path_relative = os.path.join(UPLOAD_FOLDER, f"{key}_{i}_{filename}") 
                 file_path_absolute = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path_relative)
                 uploaded_file.save(file_path_absolute)
                 file_paths_list.append(file_path_relative)
-                remote_index_start = i + 1 # Start remote file index after local files
+                remote_index_start = i + 1
 
     
-    # 3. Handle multiple remote URLs
     remote_urls = [url.strip() for url in remote_urls_input.split('\n') if url.strip()]
     
     if remote_urls:
@@ -400,7 +465,6 @@ def create_clip():
 
 @app.route('/<key>')
 def view_clip(key):
-    # ... (View clip logic remains the same)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -429,12 +493,10 @@ def view_clip(key):
     
     file_paths_list = file_path_string.split(',') if file_path_string else []
     
-    # Prepare file info for display/download
     files_info = []
     for p in file_paths_list:
         if p.strip():
             filename_with_key = os.path.basename(p.strip())
-            # We skip the key_prefix and index part
             original_filename = filename_with_key.split('_', 2)[-1] 
             files_info.append({'path': p.strip(), 'name': original_filename})
 
@@ -451,7 +513,6 @@ def view_clip(key):
 
 @app.route('/download/<path:file_path>')
 def download_file(file_path):
-    # ... (Download logic remains the same)
     if not file_path.startswith(UPLOAD_FOLDER + '/'):
          flash('Invalid download request.', 'error')
          return redirect(url_for('index'))
@@ -501,6 +562,11 @@ def download_file(file_path):
 def admin_login():
     if request.method == 'POST':
         password = request.form.get('password')
+        
+        # Reload hash in case of command line reset
+        load_dotenv(override=True)
+        ADMIN_PASSWORD_HASH = os.getenv('ADMIN_PASSWORD_HASH')
+
         if ADMIN_PASSWORD_HASH and check_password_hash(ADMIN_PASSWORD_HASH, password):
             session['logged_in'] = True
             flash('Login successful!', 'success')
@@ -517,7 +583,7 @@ def admin_logout():
     return redirect(url_for('admin_login'))
 
 
-# --- Admin Routes ---
+# --- Admin Routes (Same as V17) ---
 
 @app.route('/admin')
 @login_required
@@ -566,13 +632,12 @@ def admin_panel():
                            total_size_mb=f"{total_size_mb:.2f}", 
                            total_files=total_files, 
                            server_port=CLIPBOARD_PORT,
-                           admin_port=CLIPBOARD_PORT) # Admin port is now the same as clipboard port
+                           admin_port=CLIPBOARD_PORT)
 
 
 @app.route('/admin/delete/<int:clip_id>', methods=['POST'])
 @login_required
 def delete_clip(clip_id):
-    # ... (Delete logic remains the same)
     db = get_db()
     cursor = db.cursor()
 
@@ -600,7 +665,6 @@ def delete_clip(clip_id):
 @app.route('/admin/edit_key/<int:clip_id>', methods=['GET', 'POST'])
 @login_required
 def edit_key(clip_id):
-    # ... (Edit key logic remains the same)
     db = get_db()
     cursor = db.cursor()
 
@@ -643,7 +707,6 @@ def edit_key(clip_id):
 @app.route('/admin/edit_content/<int:clip_id>', methods=['GET', 'POST'])
 @login_required
 def edit_content(clip_id):
-    # ... (Edit content logic remains the same)
     db = get_db()
     cursor = db.cursor()
     
@@ -671,17 +734,28 @@ def edit_content(clip_id):
     return render_template('edit_content.html', clip=clip, file_list=file_list, admin_port=CLIPBOARD_PORT)
 
 
+# --- Main Execution ---
 if __name__ == '__main__':
+    # Check for command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == 'reset-password':
+        reset_admin_password()
+        sys.exit(0)
+    
+    # Normal Flask/Gunicorn startup
     init_db()
     app.run(host='0.0.0.0', port=CLIPBOARD_PORT, debug=True)
-PYEOF_APP_MERGED
+
+PYEOF_APP_MERGED_V18
 
 
 # ============================================
-# 5. Create Templates 
+# 5. Create Templates (No change needed from V17)
 # ============================================
-print_status "5/7: Creating/Updating HTML Templates (Adding Multi-File Input)..."
+print_status "5/7: Templates are already up-to-date (V17 files are sufficient)..."
+# The HTML templates (index.html, admin.html, login.html, etc.) from V17 are reused 
+# as the password reset logic is handled via the command line utility in app.py.
 
+# (Re-creating templates to ensure clean installation in case of manual deletion)
 # --- index.html (Updated for multiple file input) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'HTM_INDEX_MULTI'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Internet Clipboard</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; }textarea, input[type="file"], input[type="text"] { width: 95%; padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.3s; }input[type="submit"]:hover { background-color: #0056b3; }.flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }</style></head><body><div class="container"><h2>Clipboard Server</h2><p>Share text, local files, or remote file URLs between devices.</p>
@@ -720,10 +794,7 @@ https://another.com/image.jpg
 <p>Content/file will be automatically deleted after **{{ EXPIRY_DAYS }} days**.</p></div></body></html>
 HTM_INDEX_MULTI
 
-# --- login.html, admin.html, edit_key.html, edit_content.html (Need to be included to ensure V17 has all necessary templates)
-# The content is the same as V16, only ensuring links use the new merged port 3214 via the admin_port variable in Python.
-
-# --- login.html --- (Used by /admin/login)
+# --- login.html ---
 cat > "$INSTALL_DIR/templates/login.html" << 'HTM_LOGIN_MERGED'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Login</title><style>
     body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
@@ -764,7 +835,7 @@ cat > "$INSTALL_DIR/templates/login.html" << 'HTM_LOGIN_MERGED'
 </html>
 HTM_LOGIN_MERGED
 
-# --- admin.html --- (Used by /admin)
+# --- admin.html ---
 cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN_GRAPHICAL_MERGED'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title><style>
     /* Global Styles */
@@ -903,8 +974,8 @@ cat > "$INSTALL_DIR/templates/admin.html" << 'HTM_ADMIN_GRAPHICAL_MERGED'
 </html>
 HTM_ADMIN_GRAPHICAL_MERGED
 
-# --- clipboard.html --- (Used by /<key>)
-cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD_MERGED'
+# --- clipboard.html ---
+cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD_MERGED_2'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }
 .file-list { list-style: none; padding: 0; }
 .file-list li { margin-bottom: 8px; }
@@ -923,9 +994,9 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD_MERGED'
 {% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
     **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">Create New Clip</a></p>
 {% endif %}</div></body></html>
-HTM_CLIPBOARD_MERGED
+HTM_CLIPBOARD_MERGED_2
 
-# --- edit_key.html --- (Used by /admin/edit_key)
+# --- edit_key.html ---
 cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY_MERGED'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Key</title><style>
     body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
@@ -975,7 +1046,7 @@ cat > "$INSTALL_DIR/templates/edit_key.html" << 'HTM_EDIT_KEY_MERGED'
 </html>
 HTM_EDIT_KEY_MERGED
 
-# --- edit_content.html --- (Used by /admin/edit_content)
+# --- edit_content.html ---
 cat > "$INSTALL_DIR/templates/edit_content.html" << 'HTM_EDIT_CONTENT_MERGED'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Content</title><style>
     body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; text-align: center; padding: 50px 10px; }
@@ -1024,28 +1095,6 @@ cat > "$INSTALL_DIR/templates/edit_content.html" << 'HTM_EDIT_CONTENT_MERGED'
 </html>
 HTM_EDIT_CONTENT_MERGED
 
-# --- clipboard.html ---
-cat > "$INSTALL_DIR/templates/clipboard.html" << 'HTM_CLIPBOARD_MERGED_2'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard - {{ key }}</title><style>body { font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333; text-align: center; padding: 50px 10px; }.container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); max-width: 600px; margin: 0 auto; } .content-box { border: 1px solid #ccc; background-color: #eee; padding: 15px; margin-top: 15px; text-align: left; white-space: pre-wrap; word-wrap: break-word; border-radius: 4px; }a { color: #007bff; text-decoration: none; font-weight: bold; }a:hover { text-decoration: underline; }.flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 10px; margin-bottom: 10px; border-radius: 4px; text-align: left; }.file-info { background-color: #e9f7fe; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: left; }
-.file-list { list-style: none; padding: 0; }
-.file-list li { margin-bottom: 8px; }
-</style></head><body><div class="container"><h2>Clipboard: {{ key }}</h2>
-{% with messages = get_flashed_messages(with_categories=true) %}
-{% if messages %}
-<ul style="list-style: none; padding: 0;">
-{% for category, message in messages %}
-    {% if category != 'form_data' %}
-        <li class="flash-{{ category }}">{{ message | safe }}</li>
-    {% endif %}
-{% endfor %}
-</ul>
-{% endif %}
-{% endwith %}
-{% if clip is none %}<div class="flash-error">{% if expired %}❌ This link has expired and its content has been deleted.{% else %}❌ No content found at this address.{% endif %}</div><p><a href="{{ url_for('index') }}">Return to Home</a></p>{% else %}{% if files_info %}<div class="file-info"><h3>Attached Files:</h3><ul class="file-list">{% for file in files_info %}<li><a href="{{ url_for('download_file', file_path=file['path']) }}">Download File: {{ file['name'] }}</a></li>{% endfor %}</ul></div>{% endif %}{% if content %}<h3>Text Content:</h3><div class="content-box">{{ content }}</div>{% endif %}<p style="margin-top: 20px;">⏱️ Remaining Expiry:<br>
-    **{{ expiry_info_days }}** days, **{{ expiry_info_hours }}** hours, **{{ expiry_info_minutes }}** minutes</p><p><a href="{{ url_for('index') }}" style="margin-top: 20px; display: inline-block;">Create New Clip</a></p>
-{% endif %}</div></body></html>
-HTM_CLIPBOARD_MERGED_2
-
 # ============================================
 # 6. Create Systemd Service (Single Service)
 # ============================================
@@ -1062,6 +1111,7 @@ Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} app:app
+# Use ExecStartPost to clean up temp files if necessary, or rely on internal cleanup
 Restart=always
 TimeoutSec=30
 
@@ -1078,7 +1128,8 @@ print_status "7/7: Initializing Database and starting service..."
 systemctl is-active --quiet admin.service && systemctl stop admin.service || true
 systemctl is-enabled --quiet admin.service && systemctl disable admin.service || true
 
-$PYTHON_VENV_PATH -c "from app import init_db; init_db()"
+# Initialize DB using the venv Python
+"$PYTHON_VENV_PATH" -c "from app import init_db; init_db()"
 
 systemctl daemon-reload
 systemctl enable clipboard.service
@@ -1086,13 +1137,15 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V17)"
+echo "🎉 Installation Complete (Clipboard Server V18)"
 echo "================================================"
 echo "✅ CLIPBOARD & ADMIN STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
 echo "------------------------------------------------"
 echo "🌐 CLIPBOARD URL: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "🔒 ADMIN PANEL URL: http://YOUR_IP:${CLIPBOARD_PORT}/admin/login"
-echo "⚠️  Remember the password you entered during installation."
+echo "------------------------------------------------"
+echo "🚨 FORGOT PASSWORD? Run this command on the server:"
+echo "   ${YELLOW}sudo ${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/app.py reset-password${NC}"
 echo "------------------------------------------------"
 echo "Status:   sudo systemctl status clipboard.service"
 echo "Restart:  sudo systemctl restart clipboard.service"
