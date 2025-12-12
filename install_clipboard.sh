@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V25 - FIX: SQLite concurrency issue (Clip Not Found on redirect) using URI mode.
+# V26 - FINAL FIX: SQLite concurrency issue (Clip Not Found) using WAL mode and check_same_thread=False.
 
 set -e
 
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V25 - SQLite Concurrency Fix)"
+echo "📋 Internet Clipboard Server Installer (V26 - Final Concurrency Fix)"
 echo "=================================================="
 
 # ============================================
@@ -80,7 +80,7 @@ ENVEOF
 # ============================================
 # 3. Create web_service.py (Full Submission + View Only)
 # ============================================
-print_status "3/6: Creating web_service.py (Full Submission + View Only - V25 Fix)..."
+print_status "3/6: Creating web_service.py (V26 - Concurrency Fix)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -112,19 +112,24 @@ ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        # FIX V25: Use URI mode and timeout to handle Gunicorn concurrency and database locking issues
+        # V26 FIX: Use check_same_thread=False and WAL mode for robust concurrency with Gunicorn workers
         db = g._database = sqlite3.connect(
             f'file:{DATABASE_PATH}?mode=rw', 
             uri=True, 
-            timeout=10 # Wait up to 10 seconds for database lock
+            timeout=10, 
+            check_same_thread=False # Allows connections to be shared across threads/workers for better concurrency handling in Flask
         )
         db.row_factory = sqlite3.Row 
+        # Enable Write-Ahead Logging (WAL) mode for better concurrency (readers don't block writers)
+        db.execute('PRAGMA journal_mode=WAL') 
+        db.execute('PRAGMA foreign_keys=ON') 
     return db
 
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
     if db is not None:
+        # Close the connection when the application context tears down
         db.close()
 
 def allowed_file(filename):
@@ -351,7 +356,7 @@ PYEOF_WEB_SERVICE
 # 4. Create clipboard_cli.py (The CLI Management Tool - NO CHANGE)
 # ============================================
 print_status "4/6: Creating clipboard_cli.py (CLI Management Tool - No Change)..."
-# The content of clipboard_cli.py remains the same as V23/V24 but we ensure its existence.
+# The content of clipboard_cli.py remains the same as V23/V24/V25 but we ensure its existence.
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -680,247 +685,4 @@ print_status "5/6: Creating HTML templates (Web Submission Form - No Change)..."
 
 # --- index.html (FULL SUBMISSION FORM) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Internet Clipboard Server - Create</title>
-    <style>
-        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 700px; margin: 20px auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
-        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
-        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        form div { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        textarea, input[type="text"], input[type="file"] { 
-            width: 100%; 
-            padding: 10px; 
-            box-sizing: border-box; 
-            border: 1px solid #ccc; 
-            border-radius: 6px;
-        }
-        textarea { height: 120px; resize: vertical; }
-        input[type="submit"] {
-            background-color: #5cb85c;
-            color: white;
-            padding: 12px 20px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 1.1em;
-            transition: background-color 0.3s;
-        }
-        input[type="submit"]:hover { background-color: #4cae4c; }
-        .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📋 Internet Clipboard Server (Create Clip)</h1>
-        
-        <div class="flash error">
-            {% for message in get_flashed_messages(category_filter=['error']) %}
-                {{ message }}
-            {% endfor %}
-        </div>
-        
-        <form method="POST" enctype="multipart/form-data">
-            <div>
-                <label for="content">Text Content (Optional):</label>
-                <textarea id="content" name="content" placeholder="Paste your text here..."></textarea>
-            </div>
-            
-            <div>
-                <label for="files">Upload Files (Optional - Max 50MB):</label>
-                <input type="file" id="files" name="files" multiple>
-            </div>
-            
-            <div>
-                <label for="custom_key">Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
-                <input type="text" id="custom_key" name="custom_key" placeholder="Leave empty for a random key">
-            </div>
-            
-            <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
-        </form>
-        
-        <div class="cli-note">
-            ⚠️ The Admin Panel is only available via the Command Line Interface (CLI) on the server. 
-            Connect via SSH and run: 
-            <code>sudo /opt/clipboard_server/venv/bin/python3 /opt/clipboard_server/clipboard_cli.py</code>
-        </div>
-    </div>
-</body>
-</html>
-INDEXEOF
-
-# --- clipboard.html (Remains the same for viewing - ensure it's present) ---
-cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clip: {{ key }}</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1 { color: #007bff; text-align: center; margin-bottom: 20px; }
-        pre { background-color: #eee; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; overflow: auto; max-height: 400px; margin-bottom: 20px; border: 1px solid #ccc; position: relative; }
-        .content-section { margin-bottom: 30px; }
-        .files-section { margin-bottom: 30px; border-top: 1px solid #eee; padding-top: 20px; }
-        .files-section h2 { color: #333; font-size: 1.2em; margin-bottom: 15px; }
-        .file-item { display: flex; justify-content: space-between; align-items: center; background-color: #f0f8ff; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px; border-left: 5px solid #007bff; }
-        .file-item a { color: #007bff; text-decoration: none; font-weight: bold; }
-        .file-item a:hover { text-decoration: underline; }
-        .expiry-info { text-align: center; color: #d9534f; font-weight: bold; margin-bottom: 20px; }
-        .back-link { display: block; text-align: center; margin-top: 30px; }
-        .back-link a { color: #007bff; text-decoration: none; font-weight: bold; }
-        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
-        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: right; margin-left: 10px; }
-        .copy-button:hover { background-color: #4cae4c; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="flash error">
-            {% for category, message in get_flashed_messages(with_categories=true) %}
-                {% if category == 'error' %}
-                    {{ message }}
-                {% endif %}
-            {% endfor %}
-        </div>
-        
-        {% if clip and content %}
-            <h1>Clip Content for: {{ key }}</h1>
-            
-            <div class="expiry-info">
-                Expires in: {{ expiry_info_days }} days, {{ expiry_info_hours }} hours, and {{ expiry_info_minutes }} minutes.
-            </div>
-
-            <div class="content-section">
-                <h2>Text Content</h2>
-                <button class="copy-button" onclick="copyContent()">Copy Text</button>
-                <pre id="text-content">{{ content }}</pre>
-            </div>
-        {% elif expired %}
-            <h1>Clip Not Found</h1>
-            <div class="expiry-info">This clipboard link has expired and its content has been deleted.</div>
-        {% else %}
-             <h1>Clip Not Found</h1>
-             <div class="expiry-info">The clip with key **{{ key }}** does not exist.</div>
-        {% endif %}
-        
-        {% if files_info %}
-            <div class="files-section">
-                <h2>Attached Files ({{ files_info|length }})</h2>
-                {% for file in files_info %}
-                    <div class="file-item">
-                        <span>{{ file.name }}</span>
-                        <a href="{{ url_for('download_file', file_path=file.path) }}">Download</a>
-                    </div>
-                {% endfor %}
-            </div>
-        {% endif %}
-
-        <div class="back-link">
-            <a href="/">← Create New Clip</a>
-        </div>
-    </div>
-
-    <script>
-        function copyContent() {
-            const content = document.getElementById('text-content').innerText;
-            navigator.clipboard.writeText(content).then(() => {
-                alert('Text copied to clipboard!');
-            }).catch(err => {
-                console.error('Could not copy text: ', err);
-            });
-        }
-    </script>
-</body>
-</html>
-CLIPBOARDEOF
-
-# --- error.html (Same as V23) ---
-cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Error</title>
-    <style>
-        body { font-family: sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
-        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1 { color: #dc3545; margin-bottom: 20px; }
-        p { font-size: 1.1em; color: #555; }
-        .error-message { margin-top: 30px; padding: 15px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; color: #721c24; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Internal Error</h1>
-        <div class="error-message">
-            <p>{{ message }}</p>
-        </div>
-        <p>This is likely a server configuration issue.</p>
-        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
-    </div>
-</body>
-</html>
-ERROREOF
-
-
-# ============================================
-# 6. Create Systemd Service (Single Service for Web View)
-# ============================================
-print_status "6/7: Creating Systemd service for web server..."
-
-# --- clipboard.service (Port 3214 - Runs web_service.py) ---
-cat > /etc/systemd/system/clipboard.service << SERVICEEOF
-[Unit]
-Description=Flask Clipboard Web Server (Full Submission, CLI Management)
-After=network.target
-
-[Service]
-Type=simple
-User=root 
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=${GUNICORN_VENV_PATH} --workers 4 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
-Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
-Restart=always
-TimeoutSec=30
-
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
-
-
-# ============================================
-# 7. Final Steps
-# ============================================
-print_status "7/7: Initializing Database and starting service..."
-
-# Initialize DB using the venv Python, ensuring the database file and table exist BEFORE Gunicorn starts
-"$PYTHON_VENV_PATH" "$INSTALL_DIR/clipboard_cli.py" --init-db 
-
-systemctl daemon-reload
-systemctl enable clipboard.service
-systemctl restart clipboard.service
-
-echo ""
-echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V25 - Final Concurrency Fix)"
-echo "================================================"
-echo "✅ WEB SERVICE STATUS (Port ${CLIPBOARD_PORT}): $(systemctl is-active clipboard.service)"
-echo "------------------------------------------------"
-echo "🌐 CREATE CLIP (Web Interface): http://YOUR_IP:${CLIPBOARD_PORT}"
-echo "------------------------------------------------"
-echo "💻 ADMIN/MANAGEMENT (CLI Only):"
-echo -e "   ${BLUE}sudo ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py${NC}"
-echo "------------------------------------------------"
-echo "Logs:     sudo journalctl -u clipboard.service -f"
-echo "================================================"
+<!DOCTYPE
