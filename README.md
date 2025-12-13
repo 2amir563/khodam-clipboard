@@ -24,6 +24,15 @@ sudo /opt/clipboard_server/clipboard_cli.sh
 
 # سپس گزینه 2 (لیست تمام کلیپ‌ها) را انتخاب کنید.
 
+
+🚀 دستور یکپارچه حذف نصب
+پس از آپلود فایل uninstall.sh با محتوای بالا در آدرس گیت‌هاب خود، می‌توانید از دستور تک خطی زیر برای حذف کامل برنامه از سرور استفاده کنید:
+
+
+```
+curl -o uninstall.sh https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/uninstall.sh && chmod +x uninstall.sh && sudo ./uninstall.sh
+```
+
 ✅ WEB SERVICE STATUS (Port 3214): active
 ------------------------------------------------
 🌐 CLIPBOARD URL (View Only): http://YOUR_IP:3214
