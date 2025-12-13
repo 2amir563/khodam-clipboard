@@ -1014,7 +1014,7 @@ print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
 # --- index.html (Retained) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1051,7 +1051,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </head>
 <body>
     <div class="container">
-        <h1>📋 سرور کلیپ‌بورد اینترنتی (ایجاد کلیپ)</h1>
+        <h1>📋 Internet Clipboard Server (Create Clip)</h1>
         
         <div class="flash error">
             {% for message in get_flashed_messages(category_filter=['error']) %}
@@ -1061,31 +1061,31 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         
         <form method="POST" enctype="multipart/form-data">
             <div>
-                <label for="content">محتوای متنی (اختیاری):</label>
-                <textarea id="content" name="content" placeholder="متن خود را اینجا بچسبانید...">{{ old_content }}</textarea>
+                <label for="content">Text Content (Optional):</label>
+                <textarea id="content" name="content" placeholder="Paste your text here...">{{ old_content }}</textarea>
             </div>
             
             <div>
-                <label for="files">آپلود فایل محلی (اختیاری):</label>
+                <label for="files">Local File Upload (Optional):</label>
                 <input type="file" id="files" name="files" multiple>
             </div>
             
              {# V37: New field for URL uploads #}
             <div>
-                <label for="url_files">آپلود فایل از طریق لینک URL (اختیاری - هر لینک در یک خط جدا):</label>
-                <textarea id="url_files" name="url_files" placeholder="لینک فایل‌ها را وارد کنید...">{{ old_url_files }}</textarea>
+                <label for="url_files">File Upload via URL Link (Optional - One link per line):</label>
+                <textarea id="url_files" name="url_files" placeholder="Enter file links...">{{ old_url_files }}</textarea>
             </div>
 
             <div>
-                <label for="custom_key">کلید لینک سفارشی (اختیاری، مثال: 'my-secret-key'):</label>
-                <input type="text" id="custom_key" name="custom_key" placeholder="برای کلید تصادفی خالی بگذارید" value="{{ old_custom_key }}">
+                <label for="custom_key">Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
+                <input type="text" id="custom_key" name="custom_key" placeholder="Leave blank for a random key" value="{{ old_custom_key }}">
             </div>
             
-            <input type="submit" value="ایجاد کلیپ (در {{ EXPIRY_DAYS }} روز منقضی می‌شود)">
+            <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
         </form>
         
         <div class="cli-note">
-            ⚠️ پنل مدیریت فقط از طریق واسط خط فرمان (CLI) در سرور قابل دسترسی است: 
+            ⚠️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
             <code>sudo /opt/clipboard_server/clipboard_cli.sh</code>
         </div>
     </div>
@@ -1096,7 +1096,7 @@ INDEXEOF
 # --- clipboard.html (V41 + FIX: Reliable Copy Logic) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1133,48 +1133,48 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         
         {# V35 FIX: Check if clip exists AND (has content OR has files_info). #}
         {% if clip and (content or files_info) %}
-            <h1>محتوای کلیپ برای: {{ key }}</h1>
+            <h1>Clip Content for: {{ key }}</h1>
             
             <div class="expiry-info">
-                منقضی می‌شود در: {{ expiry_info_days }} روز، {{ expiry_info_hours }} ساعت، و {{ expiry_info_minutes }} دقیقه.
+                Expires in: {{ expiry_info_days }} days, {{ expiry_info_hours }} hours, and {{ expiry_info_minutes }} minutes.
             </div>
 
             <div class="content-section">
-                <h2>محتوای متنی</h2>
+                <h2>Text Content</h2>
                 {% if content %}
-                    <button class="copy-button" onclick="copyContent()">کپی متن</button>
+                    <button class="copy-button" onclick="copyContent()">Copy Text</button>
                     <pre id="text-content">{{ content }}</pre>
                 {% else %}
-                    <p> (این کلیپ حاوی محتوای متنی نیست و فقط دارای فایل ضمیمه می‌باشد) </p>
+                    <p> (This clip contains no text content and only has attached files) </p>
                 {% endif %}
             </div>
         
         {# اگر کلیپ پیدا نشد یا منقضی شده بود #}
         {% else %}
-             <h1>کلیپ یافت نشد</h1>
+             <h1>Clip Not Found</h1>
              <div class="expiry-info">
                  {% if expired %}
-                     این لینک کلیپ‌بورد منقضی شده است و محتوای آن حذف شده است.
+                     This clipboard link has expired and its content has been deleted.
                  {% else %}
-                     کلیپ با کلید **{{ key }}** وجود ندارد.
+                     Clip with key **{{ key }}** does not exist.
                  {% endif %}
              </div>
         {% endif %}
         
         {% if files_info %}
             <div class="files-section">
-                <h2>فایل‌های ضمیمه ({{ files_info|length }})</h2>
+                <h2>Attached Files ({{ files_info|length }})</h2>
                 {% for file in files_info %}
                     <div class="file-item">
                         <span>{{ file.name }}</span>
-                        <a href="{{ url_for('download_file', file_path=file.path) }}">دانلود</a>
+                        <a href="{{ url_for('download_file', file_path=file.path) }}">Download</a>
                     </div>
                 {% endfor %}
             </div>
         {% endif %}
 
         <div class="back-link">
-            <a href="/">← ایجاد کلیپ جدید</a>
+            <a href="/">← Create New Clip</a>
         </div>
     </div>
 
@@ -1182,14 +1182,14 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         function copyContent() {
             const contentElement = document.getElementById('text-content');
             if (!contentElement) {
-                alert('عنصر متن پیدا نشد!');
+                alert('Text element not found!');
                 return;
             }
             
             // 1. Try modern clipboard API (async, preferred)
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(contentElement.innerText).then(() => {
-                    alert('متن در کلیپ‌بورد کپی شد! (API مدرن)');
+                    alert('Text copied to clipboard! (Modern API)');
                 }).catch(err => {
                     // Fallback if permission is denied or API fails
                     console.error('Copy failed (Modern API): ', err);
@@ -1223,10 +1223,10 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 document.execCommand('copy');
                 document.body.removeChild(tempTextArea);
                 
-                alert('متن در کلیپ‌بورد کپی شد! (روش سازگار)');
+                alert('Text copied to clipboard! (Compatible Method)');
             } catch (err) {
                 console.error('Copy failed (Fallback): ', err);
-                alert('خطا در کپی! لطفا متن را به صورت دستی انتخاب و کپی کنید.');
+                alert('Copy Error! Please manually select and copy the text.');
             }
         }
     </script>
@@ -1238,7 +1238,7 @@ CLIPBOARDEOF
 # --- error.html --- (No Change)
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1253,12 +1253,12 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 </head>
 <body>
     <div class="container">
-        <h1>❌ خطای داخلی</h1>
+        <h1>❌ Internal Error</h1>
         <div class="error-message">
             <p>{{ message }}</p>
         </div>
-        <p>این احتمالاً یک مشکل پیکربندی سرور است.</p>
-        <p>لطفاً لاگ‌های سرور (<code>sudo journalctl -u clipboard.service</code>) را بررسی کنید و مطمئن شوید که ابزار CLI حداقل یک بار اجرا شده است.</p>
+        <p>This is likely a server configuration issue.</p>
+        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
     </div>
 </body>
 </html>
@@ -1312,14 +1312,14 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 نصب کامل شد (Clipboard Server V41 + Fix کپی)"
+echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix)"
 echo "================================================"
-echo "✅ سرویس وب در پورت ${CLIPBOARD_PORT} فعال است (با 2 Worker)."
+echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
 echo "------------------------------------------------"
-echo "🌐 آدرس وب: http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 Web Address: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 مدیریت CLI (برای لیست/حذف/تغییر انقضا):"
+echo "💻 CLI Management (for list/delete/change expiry):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
-echo "Logها:    sudo journalctl -u clipboard.service -f"
+echo "Logs:    sudo journalctl -u clipboard.service -f"
 echo "================================================"
