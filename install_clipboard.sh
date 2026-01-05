@@ -2,7 +2,6 @@
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
 # V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
 # FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
-# MOD: Enhanced download system with curl/wget fallbacks and better error handling
 
 set -e
 
@@ -32,19 +31,19 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 + Robust Download System)"
+echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix)"
 echo "=================================================="
 
 # ============================================
-# 1. System Setup & Venv (WITH CURL/WGET)
+# 1. System Setup & Venv
 # ============================================
-print_status "1/7: Preparing system with curl/wget and cleaning old DB..."
+print_status "1/7: Preparing system, virtual environment, and cleaning old DB..."
 
 # Stop service if running 
 systemctl stop clipboard.service 2>/dev/null || true
 
 apt update -y
-apt install -y python3 python3-pip python3-venv curl wget net-tools
+apt install -y python3 python3-pip python3-venv curl wget
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
@@ -57,12 +56,12 @@ source venv/bin/activate || true
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# Ensure dependencies are installed
+# Ensure dependencies are installed (requests added for URL download)
 cat > requirements.txt << 'REQEOF'
-Flask==2.3.3
-python-dotenv==1.0.0
-gunicorn==21.2.0
-requests==2.31.0
+Flask
+python-dotenv
+gunicorn
+requests
 REQEOF
 pip install -r requirements.txt || true
 deactivate
@@ -97,9 +96,9 @@ fi
 
 
 # ============================================
-# 3. Create web_service.py (ROBUST DOWNLOAD SYSTEM)
+# 3. Create web_service.py (V37/V41 Logic - Retained)
 # ============================================
-print_status "3/7: Creating web_service.py (Robust download with multiple methods)..."
+print_status "3/7: Creating web_service.py (V41 Logic - Retained)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -107,16 +106,11 @@ import re
 import string
 import random
 import time
-import urllib.parse
-import subprocess
-import tempfile
-import ssl
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
 from werkzeug.utils import secure_filename
 import requests 
-import socket
 
 # --- Configuration & Init ---
 # Reload environment variables for Flask every time, especially EXPIRY_DAYS
@@ -130,32 +124,8 @@ UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-
-# Extended list of allowed file extensions
-ALLOWED_EXTENSIONS = {
-    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'svg', 'webp', 'tiff', 'psd',
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg', 
-    'mp3', 'mp4', 'avi', 'mkv', 'mov', 'wmv', 'flv', 'webm', 'm4a', 'wav', 'ogg', 'flac',
-    'exe', 'msi', 'apk', 'deb', 'rpm', 'apks', 'xapk', 'appimage',
-    'bin', 'dll', 'so', 'dylib', 'sys', 'drv',
-    'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
-    'html', 'htm', 'css', 'js', 'json', 'xml', 'csv', 'sql', 'py', 'java', 'cpp', 'c', 'h',
-    'ps1', 'bat', 'sh', 'bash', 'zsh', 'fish',
-    'ttf', 'otf', 'woff', 'woff2', 'eot',
-    'torrent', 'md', 'rst', 'log', 'ini', 'conf', 'cfg', 'yml', 'yaml',
-    'key', 'pem', 'crt', 'cer', 'pfx', 'p12',
-    'db', 'sqlite', 'sqlite3', 'mdb', 'accdb',
-    'sketch', 'fig', 'xd', 'ai', 'ps', 'eps',
-    '3ds', 'obj', 'fbx', 'stl', 'blend', 'ma', 'mb',
-    'vmdk', 'vhd', 'vhdx', 'ova', 'ovf',
-    'epub', 'mobi', 'azw', 'azw3', 'fb2',
-    'heic', 'heif', 'cr2', 'nef', 'arw', 'orf',
-    'swf', 'swc', 'fla', 'as', 'mxml',
-    'lua', 'pl', 'pm', 'tcl', 'rb', 'go', 'rs', 'php', 'asp', 'aspx',
-    'djvu', 'xps', 'oxps', 'ps', 'eps', 'ai',
-    'pkg', 'run', 'sh', 'bash', 'zsh', 'fish',
-    'reg', 'inf', 'cat', 'msc', 'msi', 'msp', 'mst'
-}
+# 🔴 FIXED: Extended ALLOWED_EXTENSIONS to include all requested formats
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso', 'apk', 'apks', 'deb', 'msi', 'dmg', 'tar', 'gz', 'xz', 'bz2', 'xz'}
 
 # --- Utility Functions ---
 def get_db():
@@ -219,294 +189,60 @@ def cleanup_expired_clips():
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     db.commit() 
 
-def test_network_connection():
-    """Test if we can reach common external servers"""
-    test_urls = [
-        "https://google.com",
-        "https://github.com",
-        "https://cloudflare.com"
-    ]
-    
-    results = []
-    for url in test_urls:
-        try:
-            response = requests.head(url, timeout=5)
-            results.append(f"{url}: HTTP {response.status_code}")
-        except Exception as e:
-            results.append(f"{url}: Failed - {str(e)}")
-    
-    return results
-
-def download_with_requests(url, output_path, timeout=30):
-    """Download using requests library with multiple retries"""
-    headers_list = [
-        {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        },
-        {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Encoding': 'gzip, deflate, br'
-        },
-        {
-            'User-Agent': 'curl/7.88.1',
-            'Accept': '*/*'
-        }
-    ]
-    
-    for i, headers in enumerate(headers_list):
-        try:
-            print(f"[DEBUG] Requests attempt {i+1} for {url}")
-            response = requests.get(
-                url, 
-                headers=headers,
-                stream=True, 
-                timeout=timeout,
-                verify=True,
-                allow_redirects=True
-            )
-            
-            if response.status_code == 200:
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                
-                # Verify file was downloaded
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                    print(f"[DEBUG] Successfully downloaded {os.path.getsize(output_path)} bytes")
-                    return True, f"Downloaded with requests (method {i+1})"
-                else:
-                    print(f"[DEBUG] File empty or not created")
-                    continue
-            else:
-                print(f"[DEBUG] HTTP {response.status_code} with method {i+1}")
-                if response.status_code == 503:
-                    return False, f"Server unavailable (503) - likely server-side issue"
-                
-        except requests.exceptions.SSLError:
-            # Try without SSL verification
-            try:
-                response = requests.get(
-                    url, 
-                    headers=headers,
-                    stream=True, 
-                    timeout=timeout,
-                    verify=False,
-                    allow_redirects=True
-                )
-                if response.status_code == 200:
-                    with open(output_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                        return True, f"Downloaded with requests (no SSL verify)"
-            except Exception as e:
-                print(f"[DEBUG] SSL retry failed: {e}")
-                continue
-                
-        except Exception as e:
-            print(f"[DEBUG] Requests method {i+1} failed: {e}")
-            continue
-    
-    return False, "All requests methods failed"
-
-def download_with_wget(url, output_path, timeout=60):
-    """Download using wget command"""
-    try:
-        # Clean URL for wget
-        clean_url = url.strip()
-        
-        # Create wget command
-        cmd = [
-            'wget',
-            '-O', output_path,
-            '-T', str(timeout),
-            '--tries', '3',
-            '--retry-connrefused',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            '--header=Accept: */*',
-            '--header=Accept-Language: en-US,en;q=0.5',
-            '--no-check-certificate',
-            clean_url
-        ]
-        
-        print(f"[DEBUG] Running wget command: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=timeout
-        )
-        
-        print(f"[DEBUG] wget stdout: {result.stdout[:200]}")
-        print(f"[DEBUG] wget stderr: {result.stderr[:200]}")
-        
-        if result.returncode == 0:
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                return True, "Downloaded with wget"
-            else:
-                return False, "wget succeeded but file is empty"
-        else:
-            return False, f"wget failed with code {result.returncode}: {result.stderr[:100]}"
-            
-    except subprocess.TimeoutExpired:
-        return False, "wget timeout"
-    except Exception as e:
-        return False, f"wget error: {str(e)}"
-
-def download_with_curl(url, output_path, timeout=60):
-    """Download using curl command"""
-    try:
-        cmd = [
-            'curl',
-            '-L',  # Follow redirects
-            '-o', output_path,
-            '-m', str(timeout),
-            '--retry', '3',
-            '--retry-delay', '5',
-            '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            '-H', 'Accept: */*',
-            '--insecure',  # Don't verify SSL
-            '--silent',
-            '--show-error',
-            url
-        ]
-        
-        print(f"[DEBUG] Running curl command: {' '.join(cmd[:10])}...")
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=timeout + 10
-        )
-        
-        if result.returncode == 0:
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                return True, "Downloaded with curl"
-            else:
-                return False, "curl succeeded but file is empty"
-        else:
-            error_msg = result.stderr[:200] if result.stderr else "Unknown error"
-            return False, f"curl failed: {error_msg}"
-            
-    except subprocess.TimeoutExpired:
-        return False, "curl timeout"
-    except Exception as e:
-        return False, f"curl error: {str(e)}"
-
 def download_and_save_file(url, key, file_paths):
     """
-    Robust file download with multiple fallback methods
+    Downloads a file from a URL, saves it, and updates file_paths list.
+    Returns: (bool success, str message)
     """
-    # Basic URL validation
-    if not url.lower().startswith(('http://', 'https://')):
-        return False, "URL must start with http:// or https://."
-    
-    # Extract filename
-    parsed_url = urllib.parse.urlparse(url)
-    filename = os.path.basename(parsed_url.path)
-    
-    if not filename or filename == '.':
-        # Generate a filename based on key
-        filename = f"download_{key}.zip"
-    
-    # Check file extension
-    if not allowed_file(filename):
-        return False, f"File type not allowed: {filename}"
-    
-    filename = secure_filename(filename)
-    unique_filename = f"{key}_{filename}"
-    full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
-    
-    print(f"[INFO] Starting download: {url}")
-    print(f"[INFO] Target file: {local_path}")
-    
-    # Create uploads directory if it doesn't exist
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    
-    # Test network connection first
-    print("[DEBUG] Testing network connectivity...")
-    network_test = test_network_connection()
-    print(f"[DEBUG] Network test results: {network_test}")
-    
-    # METHOD 1: Try curl first (most reliable for CLI)
-    print("[DEBUG] Trying curl...")
-    success, msg = download_with_curl(url, local_path, timeout=45)
-    if success:
-        file_size = os.path.getsize(local_path)
-        print(f"[SUCCESS] Downloaded {file_size} bytes with curl")
+    try:
+        # Basic URL validation
+        if not url.lower().startswith(('http://', 'https://')):
+            return False, "URL must start with http:// or https://."
+            
+        # 🔴 FIXED: Removed timeout for long downloads
+        response = requests.get(url, allow_redirects=True, stream=True, timeout=None)
+        
+        if response.status_code != 200:
+            return False, f"HTTP Error {response.status_code} when accessing URL."
+
+        # Determine filename from URL or Content-Disposition
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition:
+            # Try to extract filename from Content-Disposition header
+            fname_match = re.search(r'filename="?([^"]+)"?', content_disposition)
+            if fname_match:
+                filename = fname_match.group(1)
+            else:
+                 filename = os.path.basename(url.split('?', 1)[0])
+        else:
+            filename = os.path.basename(url.split('?', 1)[0])
+            
+        if not filename or filename == '.':
+             filename = "downloaded_file" 
+        
+        # Simple extension check
+        if not allowed_file(filename):
+            return False, f"File type not allowed for downloaded file: {filename}"
+        
+        filename = secure_filename(filename)
+        unique_filename = f"{key}_{filename}"
+        full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        # Save file to disk
+        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
         file_paths.append(full_path)
-        return True, f"Downloaded successfully ({file_size} bytes)"
-    
-    # METHOD 2: Try wget
-    print("[DEBUG] Trying wget...")
-    success, msg = download_with_wget(url, local_path, timeout=45)
-    if success:
-        file_size = os.path.getsize(local_path)
-        print(f"[SUCCESS] Downloaded {file_size} bytes with wget")
-        file_paths.append(full_path)
-        return True, f"Downloaded successfully ({file_size} bytes)"
-    
-    # METHOD 3: Try requests as last resort
-    print("[DEBUG] Trying requests...")
-    success, msg = download_with_requests(url, local_path, timeout=45)
-    if success:
-        file_size = os.path.getsize(local_path)
-        print(f"[SUCCESS] Downloaded {file_size} bytes with requests")
-        file_paths.append(full_path)
-        return True, f"Downloaded successfully ({file_size} bytes)"
-    
-    # Clean up failed download
-    if os.path.exists(local_path):
-        try:
-            os.remove(local_path)
-        except:
-            pass
-    
-    # Comprehensive error message
-    error_msg = f"""
-    ❌ Download failed for: {filename}
-    URL: {url}
-    
-    🔍 Diagnostic Information:
-    - Network test: {network_test}
-    - All download methods failed
-    
-    🛠️ Possible Causes:
-    1. Server is down or returning 503 (Service Unavailable)
-    2. Network firewall blocking the connection
-    3. DNS resolution issues
-    4. Server blocking your IP address
-    5. URL requires authentication
-    
-    💡 Solutions to Try:
-    1. Check if you can access the URL directly from your server:
-       curl -I "{url}"
-    2. Try from a different network/VPN
-    3. Download manually and use DIRECT UPLOAD
-    4. Check server firewall/iptables rules
-    5. Verify DNS is working: nslookup github.com
-    
-    📝 For GitHub releases:
-    - GitHub may rate-limit your IP
-    - Try again in a few minutes
-    - Or use direct file upload instead
-    """
-    
-    print(f"[ERROR] {error_msg}")
-    return False, error_msg
+        return True, filename
+
+    except requests.exceptions.Timeout:
+        return False, "Download failed: Connection timed out (30 seconds limit)."
+    except requests.exceptions.RequestException as e:
+        return False, f"Download failed: {e}"
+    except Exception as e:
+        return False, f"An unexpected error occurred during download: {e}"
 
 
 # --- Main Routes ---
@@ -741,21 +477,15 @@ def download_file(file_path):
                                as_attachment=True, 
                                download_name=original_filename)
 
-@app.route('/network-test')
-def network_test_page():
-    """Page to test network connectivity"""
-    test_results = test_network_connection()
-    return render_template('network_test.html', results=test_results)
-
 if __name__ == '__main__':
     pass
 
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool)
+# 4. Create clipboard_cli.py (The CLI Management Tool - V41 - Edit Clip Expiry)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - V41 - Edit Clip Expiry)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -769,7 +499,6 @@ import socket
 import shutil
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv, find_dotenv
-import requests
 
 # --- Configuration & Init ---
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -858,27 +587,6 @@ def format_remaining_time(expiry_ts):
         return f"{hours}h {minutes}m"
     else:
         return f"{minutes}m"
-
-def test_network_from_cli():
-    """Test network connectivity from CLI"""
-    print(f"\n{Color.CYAN}{Color.BOLD}--- Network Connectivity Test ---{Color.END}")
-    
-    test_urls = [
-        ("Google", "https://google.com"),
-        ("GitHub", "https://github.com"),
-        ("Cloudflare", "https://cloudflare.com")
-    ]
-    
-    for name, url in test_urls:
-        try:
-            response = requests.head(url, timeout=5)
-            print(f"{Color.GREEN}✓{Color.END} {name}: HTTP {response.status_code}")
-        except requests.exceptions.Timeout:
-            print(f"{Color.RED}✗{Color.END} {name}: Timeout")
-        except requests.exceptions.ConnectionError:
-            print(f"{Color.RED}✗{Color.END} {name}: Connection failed")
-        except Exception as e:
-            print(f"{Color.RED}✗{Color.END} {name}: {str(e)[:50]}")
 
 # --- Database Management ---
 def get_db_connection():
@@ -1031,6 +739,7 @@ def list_clips():
 
     print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
     
+    # V40/V41 Widths: ID:4, Key:10, Link:30, Content:24, Files:6, Remaining:10, Expires:20 => Total: 104
     print(f"{Color.CYAN}{'ID':<4} {'Key':<10} {'Link (IP:Port/Key)':<30} {'Content Preview':<24} {'Files':<6} {'Remaining':<10} {'Expires (UTC)':<20}{Color.END}")
     print("-" * 104)
     
@@ -1156,7 +865,7 @@ def edit_clip_expiry():
         
         new_remaining_time = format_remaining_time(new_expires_at_ts)
         print(f"\n{Color.GREEN}✅ Success! Expiry updated.{Color.END}")
-        print(f"   {Color.BOLD}New Expiry:{Color.END} {new_expiry_dt.strftime('%Y-%m-d %H:%M:%S UTC')}")
+        print(f"   {Color.BOLD}New Expiry:{Color.END} {new_expiry_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         print(f"   {Color.BOLD}Remaining:{Color.END} {new_remaining_time}")
         
     except ValueError:
@@ -1171,7 +880,7 @@ def edit_clip():
     print(f"\n{Color.CYAN}--- Select Clip Editing Option ---{Color.END}")
     print(f"1. Edit Key")
     print(f"2. Edit Content")
-    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}")
+    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}") # V41: New Option
     print(f"0. Cancel")
     
     choice = input("Enter your choice (1/2/3/0): ").strip()
@@ -1180,6 +889,7 @@ def edit_clip():
         edit_clip_expiry()
         return
 
+    # Rest of the old logic for Key/Content editing
     clip_id_or_key = input("\nEnter the ID or Key of the clip to edit (for Key/Content): ").strip()
 
     conn = get_db_connection()
@@ -1269,10 +979,9 @@ def main_menu():
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
         print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
-        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)")
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)") # V41: Updated description
         print(f"4. {Color.RED}Delete Clip{Color.END}")
-        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)")
-        print(f"6. {Color.CYAN}Test Network Connectivity{Color.END}")
+        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") 
         print("0. Exit")
         
         choice = input("Enter your choice: ").strip()
@@ -1287,8 +996,6 @@ def main_menu():
             delete_clip()
         elif choice == '5': 
             change_expiry_days()
-        elif choice == '6':
-            test_network_from_cli()
         elif choice == '0':
             print(f"\n{Color.BOLD}Exiting CLI Management. Goodbye!{Color.END}")
             break
@@ -1301,66 +1008,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create HTML Templates
+# 5. Create Minimal Templates (V41 + Fix Copy)
 # ============================================
-print_status "5/7: Creating HTML templates..."
+print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
 
-# --- network_test.html ---
-cat > "$INSTALL_DIR/templates/network_test.html" << 'NETWORKTESTEOF'
-<!DOCTYPE html>
-<html lang="en" dir="ltr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Network Test</title>
-    <style>
-        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 700px; margin: 20px auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
-        .result { padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 5px solid #007bff; background-color: #f8f9fa; }
-        .success { border-left-color: #28a745; background-color: #d4edda; }
-        .error { border-left-color: #dc3545; background-color: #f8d7da; }
-        .back-link { display: block; text-align: center; margin-top: 30px; }
-        .back-link a { color: #007bff; text-decoration: none; font-weight: bold; }
-        .troubleshoot { margin-top: 30px; padding: 20px; background-color: #fff3cd; border-radius: 8px; border: 1px solid #ffeaa7; }
-        .troubleshoot h3 { margin-top: 0; color: #856404; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌐 Network Connectivity Test</h1>
-        
-        <p>Testing connection to external servers...</p>
-        
-        {% for result in results %}
-        <div class="result {% if 'HTTP 200' in result or 'HTTP 30' in result %}success{% else %}error{% endif %}">
-            {{ result }}
-        </div>
-        {% endfor %}
-        
-        <div class="troubleshoot">
-            <h3>🔧 Troubleshooting Tips:</h3>
-            <p>If tests are failing:</p>
-            <ol>
-                <li>Check your server's internet connection</li>
-                <li>Verify firewall rules allow outbound HTTP/HTTPS</li>
-                <li>Check DNS configuration: <code>nslookup google.com</code></li>
-                <li>Test with curl: <code>curl -I https://google.com</code></li>
-                <li>Check for proxy settings</li>
-                <li>Verify server time is correct (affects SSL)</li>
-            </ol>
-            <p><strong>Note:</strong> If GitHub returns 503, it may be rate-limiting your IP.</p>
-        </div>
-        
-        <div class="back-link">
-            <a href="/">← Back to Create Clip</a>
-        </div>
-    </div>
-</body>
-</html>
-NETWORKTESTEOF
-
-# --- index.html ---
+# --- index.html (Retained) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1374,8 +1026,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
         .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
         .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
-        .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
         form div { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
         textarea, input[type="text"], input[type="file"] { 
@@ -1398,11 +1048,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         }
         input[type="submit"]:hover { background-color: #4cae4c; }
         .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
-        .tips { margin-top: 20px; padding: 15px; background-color: #e8f5e8; border: 1px solid #c3e6cb; border-radius: 8px; }
-        .tips h3 { margin-top: 0; color: #155724; }
-        .tips ul { margin-bottom: 0; padding-left: 20px; }
-        .network-test { margin-top: 15px; text-align: center; }
-        .network-test a { color: #007bff; text-decoration: none; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -1415,11 +1060,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             {% endfor %}
         </div>
         
-        <div class="flash warning">
-            <strong>⚠️ Important:</strong> If URL downloads fail with 503 errors, your server may have network issues.
-            Try the <a href="/network-test" style="color: #856404; font-weight: bold;">Network Test</a> to diagnose.
-        </div>
-        
         <form method="POST" enctype="multipart/form-data">
             <div>
                 <label for="content">Text Content (Optional):</label>
@@ -1427,47 +1067,34 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             </div>
             
             <div>
-                <label for="files">📁 Local File Upload (Recommended - Most Reliable):</label>
+                <label for="files">Local File Upload (Optional):</label>
                 <input type="file" id="files" name="files" multiple>
             </div>
             
+             {# V37: New field for URL uploads #}
             <div>
-                <label for="url_files">🔗 File Upload via URL (If local upload works):</label>
-                <textarea id="url_files" name="url_files" placeholder="Enter file URLs (one per line)...">{{ old_url_files }}</textarea>
+                <label for="url_files">File Upload via URL Link (Optional - One link per line):</label>
+                <textarea id="url_files" name="url_files" placeholder="Enter file links...">{{ old_url_files }}</textarea>
             </div>
 
             <div>
-                <label for="custom_key">🔑 Custom Link Key (Optional):</label>
-                <input type="text" id="custom_key" name="custom_key" placeholder="Leave blank for random key" value="{{ old_custom_key }}">
+                <label for="custom_key">Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
+                <input type="text" id="custom_key" name="custom_key" placeholder="Leave blank for a random key" value="{{ old_custom_key }}">
             </div>
             
             <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
         </form>
         
-        <div class="network-test">
-            <a href="/network-test">🌐 Test Network Connectivity</a>
-        </div>
-        
-        <div class="tips">
-            <h3>💡 Pro Tips:</h3>
-            <ul>
-                <li><strong>For 503 errors:</strong> Use DIRECT FILE UPLOAD instead of URLs</li>
-                <li><strong>Large files:</strong> Upload directly for better reliability</li>
-                <li><strong>GitHub releases:</strong> May rate-limit your IP - try again later</li>
-                <li><strong>Network issues:</strong> Check server firewall and DNS settings</li>
-                <li><strong>Best practice:</strong> Download manually → Upload to server</li>
-            </ul>
-        </div>
-        
         <div class="cli-note">
-            ⚙️ Server Management: <code>sudo /opt/clipboard_server/clipboard_cli.sh</code>
+            ⚠️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
+            <code>sudo /opt/clipboard_server/clipboard_cli.sh</code>
         </div>
     </div>
 </body>
 </html>
 INDEXEOF
 
-# --- clipboard.html ---
+# --- clipboard.html (V41 + FIX: Reliable Copy Logic) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1505,6 +1132,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             {% endfor %}
         </div>
         
+        {# V35 FIX: Check if clip exists AND (has content OR has files_info). #}
         {% if clip and (content or files_info) %}
             <h1>Clip Content for: {{ key }}</h1>
             
@@ -1522,6 +1150,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 {% endif %}
             </div>
         
+        {# اگر کلیپ پیدا نشد یا منقضی شده بود #}
         {% else %}
              <h1>Clip Not Found</h1>
              <div class="expiry-info">
@@ -1558,32 +1187,46 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 return;
             }
             
+            // 1. Try modern clipboard API (async, preferred)
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(contentElement.innerText).then(() => {
-                    alert('Text copied to clipboard!');
+                    alert('Text copied to clipboard! (Modern API)');
                 }).catch(err => {
+                    // Fallback if permission is denied or API fails
+                    console.error('Copy failed (Modern API): ', err);
                     copyFallback(contentElement);
                 });
             } else {
+                // 2. Use deprecated execCommand fallback (synchronous)
                 copyFallback(contentElement);
             }
         }
         
         function copyFallback(element) {
             try {
+                // Create a temporary textarea for selection/copying
                 const tempTextArea = document.createElement('textarea');
                 tempTextArea.value = element.innerText;
+                
+                // Hide the textarea visually
                 tempTextArea.style.position = 'fixed';
                 tempTextArea.style.top = '0';
                 tempTextArea.style.left = '0';
                 tempTextArea.style.opacity = '0';
+                
                 document.body.appendChild(tempTextArea);
+                
+                // Select and copy
                 tempTextArea.select();
-                tempTextArea.setSelectionRange(0, 99999);
+                tempTextArea.setSelectionRange(0, 99999); // For mobile devices
+                
+                // Use deprecated but widely supported copy command
                 document.execCommand('copy');
                 document.body.removeChild(tempTextArea);
-                alert('Text copied to clipboard!');
+                
+                alert('Text copied to clipboard! (Compatible Method)');
             } catch (err) {
+                console.error('Copy failed (Fallback): ', err);
                 alert('Copy Error! Please manually select and copy the text.');
             }
         }
@@ -1592,7 +1235,8 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# --- error.html ---
+
+# --- error.html --- (No Change)
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1606,7 +1250,6 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
         h1 { color: #dc3545; margin-bottom: 20px; }
         p { font-size: 1.1em; color: #555; }
         .error-message { margin-top: 30px; padding: 15px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; color: #721c24; font-weight: bold; }
-        .troubleshoot { margin-top: 30px; padding: 20px; background-color: #fff3cd; border-radius: 8px; }
     </style>
 </head>
 <body>
@@ -1615,26 +1258,21 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
         <div class="error-message">
             <p>{{ message }}</p>
         </div>
-        <div class="troubleshoot">
-            <h3>Troubleshooting Steps:</h3>
-            <ol style="text-align: left;">
-                <li>Check server logs: <code>sudo journalctl -u clipboard.service</code></li>
-                <li>Ensure database is initialized: <code>sudo /opt/clipboard_server/clipboard_cli.sh --init-db</code></li>
-                <li>Restart the service: <code>sudo systemctl restart clipboard.service</code></li>
-                <li>Check disk space: <code>df -h</code></li>
-                <li>Verify permissions: <code>ls -la /opt/clipboard_server/</code></li>
-            </ol>
-        </div>
+        <p>This is likely a server configuration issue.</p>
+        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
     </div>
 </body>
 </html>
 ERROREOF
 
-# ============================================
-# 6. Create Systemd Service
-# ============================================
-print_status "6/7: Creating Systemd service for web server..."
 
+# ============================================
+# 6. Create Systemd Service (Workers set to 2 in V41)
+# ============================================
+print_status "6/7: Creating Systemd service for web server (Workers: 2 - V41 Optimization)..."
+
+# --- clipboard.service (Port 3214 - Runs web_service.py) ---
+# 🔴 FIXED: Removed TimeoutSec=30 and changed Gunicorn timeout to 0
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
 Description=Flask Clipboard Web Server (Full Submission, CLI Management)
@@ -1644,22 +1282,21 @@ After=network.target
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
+ExecStart=${GUNICORN_VENV_PATH} --workers 2 --timeout 0 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
-RestartSec=10
-TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
-# ============================================
-# 7. Final Steps with DIAGNOSTICS
-# ============================================
-print_status "7/7: Initializing database and starting service with diagnostics..."
 
-# Create wrapper script
+# ============================================
+# 7. Final Steps
+# ============================================
+print_status "7/7: Initializing database and starting service..."
+
+# Create a simple wrapper script for CLI execution
 cat > "$INSTALL_DIR/clipboard_cli.sh" << CLISHEOF
 #!/bin/bash
 source ${INSTALL_DIR}/venv/bin/activate
@@ -1667,68 +1304,23 @@ exec ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py "\$@"
 CLISHEOF
 chmod +x "$INSTALL_DIR/clipboard_cli.sh"
 
-# Create diagnostic script
-cat > "$INSTALL_DIR/diagnose.sh" << 'DIAGEOF'
-#!/bin/bash
-echo "🔍 Clipboard Server Diagnostics"
-echo "================================"
-
-echo "1. Checking service status..."
-systemctl status clipboard.service --no-pager
-
-echo -e "\n2. Testing network connectivity..."
-curl -I --max-time 10 https://google.com 2>/dev/null | head -1
-curl -I --max-time 10 https://github.com 2>/dev/null | head -1
-
-echo -e "\n3. Checking disk space..."
-df -h /opt
-
-echo -e "\n4. Checking server logs (last 20 lines)..."
-journalctl -u clipboard.service -n 20 --no-pager
-
-echo -e "\n5. Testing direct curl to GitHub..."
-echo "Testing: https://github.com/2dust/v2rayN/releases/download/7.16.8/v2rayN-windows-arm64-desktop.zip"
-curl -I --max-time 15 "https://github.com/2dust/v2rayN/releases/download/7.16.8/v2rayN-windows-arm64-desktop.zip" 2>&1 | head -5
-
-echo -e "\n📝 If GitHub returns 503:"
-echo "   - GitHub may be rate-limiting your IP"
-echo "   - Try again in a few minutes"
-echo "   - Use DIRECT UPLOAD instead of URLs"
-echo "   - Check server firewall/iptables rules"
-DIAGEOF
-chmod +x "$INSTALL_DIR/diagnose.sh"
-
-# Initialize DB
+# Initialize DB using the new wrapper script
 "$INSTALL_DIR/clipboard_cli.sh" --init-db 
 
 systemctl daemon-reload
 systemctl enable clipboard.service
 systemctl restart clipboard.service
 
-# Wait a moment for service to start
-sleep 3
-
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V41 + Robust Download)"
+echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix)"
 echo "================================================"
-echo "✅ Web service is active on port ${CLIPBOARD_PORT}"
+echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
 echo "------------------------------------------------"
-echo "🌐 Web Interface: http://$(hostname -I | awk '{print $1}'):${CLIPBOARD_PORT}"
+echo "🌐 Web Address: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 CLI Management:"
+echo "💻 CLI Management (for list/delete/change expiry):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
-echo "🔍 Diagnostics:"
-echo -e "   ${YELLOW}sudo ${INSTALL_DIR}/diagnose.sh${NC}"
-echo "------------------------------------------------"
-echo "📝 IMPORTANT - For 503 Errors:"
-echo "   1. Run the diagnostic script above"
-echo "   2. Use DIRECT FILE UPLOAD instead of URLs"
-echo "   3. Check server firewall/network settings"
-echo "   4. GitHub may rate-limit your IP - try later"
-echo "------------------------------------------------"
-echo "📋 Quick Test:"
-echo "   Open http://$(hostname -I | awk '{print $1}'):${CLIPBOARD_PORT} in browser"
-echo "   Upload a small file directly (not via URL)"
+echo "Logs:    sudo journalctl -u clipboard.service -f"
 echo "================================================"
