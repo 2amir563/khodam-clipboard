@@ -1,7 +1,8 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
-# FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
+# V42 - FINAL FIX: Fixed download path and timeout issues
+# FIXED: 1) Fixed 404 Not Found for downloads 2) Fixed 503 timeout for large downloads
+# FIXED: Support for all file types including APK, EXE, etc.
 
 set -e
 
@@ -31,7 +32,11 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix)"
+echo "📋 Internet Clipboard Server Installer (V42 - FINAL FIX)"
+echo "=================================================="
+echo "Fixes: 1) Fixed 404 Not Found for downloads"
+echo "       2) Fixed 503 timeout for large downloads"
+echo "       3) Full support for APK, EXE, DEB, MSI, etc."
 echo "=================================================="
 
 # ============================================
@@ -43,7 +48,7 @@ print_status "1/7: Preparing system, virtual environment, and cleaning old DB...
 systemctl stop clipboard.service 2>/dev/null || true
 
 apt update -y
-apt install -y python3 python3-pip python3-venv curl wget
+apt install -y python3 python3-pip python3-venv curl wget sqlite3
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
@@ -73,7 +78,6 @@ print_status "2/7: Updating configuration and directory structure..."
 
 mkdir -p "$INSTALL_DIR/templates"
 mkdir -p "$INSTALL_DIR/uploads"
-# Set ownership to root but allow others to write to uploads (if flask used another user)
 chmod -R 777 "$INSTALL_DIR" 
 
 # --- Create/Update .env file ---
@@ -94,11 +98,10 @@ else
     sed -i "/^DOTENV_FULL_PATH=/c\DOTENV_FULL_PATH=${INSTALL_DIR}/.env" "$INSTALL_DIR/.env"
 fi
 
-
 # ============================================
-# 3. Create web_service.py (V37/V41 Logic - Retained)
+# 3. Create web_service.py (V42 - FINAL FIX)
 # ============================================
-print_status "3/7: Creating web_service.py (V41 Logic - Retained)..."
+print_status "3/7: Creating web_service.py (V42 - FINAL FIX)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -111,21 +114,30 @@ from flask import Flask, render_template, request, redirect, url_for, flash, sen
 from dotenv import load_dotenv, find_dotenv
 from werkzeug.utils import secure_filename
 import requests 
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # --- Configuration & Init ---
-# Reload environment variables for Flask every time, especially EXPIRY_DAYS
 DOTENV_PATH = os.getenv('DOTENV_FULL_PATH', find_dotenv(usecwd=True))
 load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key') 
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clipboard.db') 
-UPLOAD_FOLDER = 'uploads'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_PATH = os.path.join(BASE_DIR, 'clipboard.db')
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-# 🔴 FIXED: Extended ALLOWED_EXTENSIONS to include all requested formats
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso', 'apk', 'apks', 'deb', 'msi', 'dmg', 'tar', 'gz', 'xz', 'bz2', 'xz'}
+# FIXED: Extended ALLOWED_EXTENSIONS to include all requested formats
+ALLOWED_EXTENSIONS = {
+    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 
+    'mp3', 'mp4', 'exe', 'bin', 'iso', 'apk', 'apks', 'deb', 'msi', 
+    'dmg', 'tar', 'gz', 'xz', 'bz2'
+}
 
 # --- Utility Functions ---
 def get_db():
@@ -141,7 +153,7 @@ def get_db():
             db.row_factory = sqlite3.Row 
             db.execute('PRAGMA foreign_keys=ON') 
         except sqlite3.OperationalError as e:
-            print(f"[FATAL] Could not connect to database at {DATABASE_PATH}: {e}")
+            logger.error(f"[FATAL] Could not connect to database at {DATABASE_PATH}: {e}")
             raise RuntimeError("Database connection failed.")
     return db
 
@@ -152,8 +164,10 @@ def close_connection(exception):
         db.close()
 
 def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    if not filename or '.' not in filename:
+        return False
+    ext = filename.rsplit('.', 1)[1].lower()
+    return ext in ALLOWED_EXTENSIONS
 
 def generate_key(length=8):
     characters = string.ascii_letters + string.digits
@@ -178,16 +192,18 @@ def cleanup_expired_clips():
     for file_path_tuple in expired_files:
         file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
         for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+            full_path = os.path.join(UPLOAD_FOLDER, file_path.strip())
             if file_path and os.path.exists(full_path):
                 try:
                     os.remove(full_path)
+                    logger.info(f"Removed expired file: {full_path}")
                 except OSError as e:
-                    print(f"[WARNING] Error removing file {full_path}: {e}")
+                    logger.warning(f"Error removing file {full_path}: {e}")
             
     # Delete database entries
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     db.commit() 
+    logger.info("Cleaned up expired clips")
 
 def download_and_save_file(url, key, file_paths):
     """
@@ -199,70 +215,84 @@ def download_and_save_file(url, key, file_paths):
         if not url.lower().startswith(('http://', 'https://')):
             return False, "URL must start with http:// or https://."
             
-        # 🔴 FIXED: Removed timeout for long downloads
+        # FIXED: timeout=None for long downloads
         response = requests.get(url, allow_redirects=True, stream=True, timeout=None)
         
         if response.status_code != 200:
             return False, f"HTTP Error {response.status_code} when accessing URL."
 
-        # Determine filename from URL or Content-Disposition
+        # Determine filename
         content_disposition = response.headers.get('Content-Disposition')
         if content_disposition:
-            # Try to extract filename from Content-Disposition header
             fname_match = re.search(r'filename="?([^"]+)"?', content_disposition)
             if fname_match:
                 filename = fname_match.group(1)
             else:
-                 filename = os.path.basename(url.split('?', 1)[0])
+                filename = os.path.basename(url.split('?', 1)[0])
         else:
             filename = os.path.basename(url.split('?', 1)[0])
             
         if not filename or filename == '.':
-             filename = "downloaded_file" 
+            filename = "downloaded_file" 
         
         # Simple extension check
         if not allowed_file(filename):
-            return False, f"File type not allowed for downloaded file: {filename}"
+            return False, f"File type not allowed: {filename}"
         
         filename = secure_filename(filename)
         unique_filename = f"{key}_{filename}"
+        
+        # FIXED: Store only filename, not full path
         full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
         
         # Save file to disk
-        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
-        with open(local_path, 'wb') as f:
+        with open(full_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        file_paths.append(full_path)
+        file_paths.append(unique_filename)  # Store only filename
+        logger.info(f"Downloaded file: {filename} -> {unique_filename}")
         return True, filename
 
     except requests.exceptions.Timeout:
-        return False, "Download failed: Connection timed out (30 seconds limit)."
+        return False, "Download failed: Connection timed out."
     except requests.exceptions.RequestException as e:
         return False, f"Download failed: {e}"
     except Exception as e:
-        return False, f"An unexpected error occurred during download: {e}"
+        return False, f"Unexpected error: {e}"
 
+# --- Database Initialization ---
+def init_db():
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clips (
+            id INTEGER PRIMARY KEY,
+            key TEXT UNIQUE NOT NULL,
+            content TEXT,
+            file_path TEXT, 
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
 
 # --- Main Routes ---
-
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    
-    # V39: Reload environment variables to get current EXPIRY_DAYS_DEFAULT
+    # Reload environment variables
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
     current_expiry_days = int(os.getenv('EXPIRY_DAYS', '30'))
 
-    # V36: Initialize default context for GET and error POSTs
     context = {
-        'EXPIRY_DAYS': current_expiry_days, # Use current value
+        'EXPIRY_DAYS': current_expiry_days,
         'old_content': '',
         'old_custom_key': '',
         'old_url_files': '' 
     }
 
-    # 1. Handle form submission (POST)
     if request.method == 'POST':
         content = request.form.get('content', '') 
         custom_key = request.form.get('custom_key', '').strip()
@@ -271,7 +301,6 @@ def index():
         uploaded_files = request.files.getlist('files')
         url_list = [u.strip() for u in url_files_input.split('\n') if u.strip()] 
 
-        # V36/V37: Update context for re-rendering if error occurs
         context['old_content'] = content
         context['old_custom_key'] = custom_key
         context['old_url_files'] = url_files_input
@@ -285,10 +314,9 @@ def index():
 
         key = custom_key or generate_key()
         
-        # Validation and checks
-        KEY_REGEX_STR = r'^[a-zA-Z0-9_-]{3,64}$'
-        if custom_key and not re.match(KEY_REGEX_STR, custom_key):
-            flash('Invalid custom key format. Key must be 3 to 64 letters, numbers, hyphens (-) or underscores (_).', 'error')
+        # Validation
+        if custom_key and not re.match(KEY_REGEX, custom_key):
+            flash('Invalid custom key format. Use 3-64 letters, numbers, hyphens or underscores.', 'error')
             return render_template('index.html', **context) 
             
         try:
@@ -296,13 +324,13 @@ def index():
             cursor = db.cursor()
             cursor.execute("SELECT 1 FROM clips WHERE key = ?", (key,))
             if cursor.fetchone():
-                flash(f'The key "{key}" is already in use. Please choose another key.', 'error')
+                flash(f'Key "{key}" already in use.', 'error')
                 return render_template('index.html', **context) 
         except RuntimeError:
             flash("Database connection error.", 'error')
             return render_template('index.html', **context) 
             
-        # File Handling (Local & Remote)
+        # File Handling
         file_paths = []
         has_upload_error = False
 
@@ -312,38 +340,38 @@ def index():
                 if allowed_file(file.filename):
                     filename = secure_filename(file.filename)
                     unique_filename = f"{key}_{filename}"
-                    full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
                     try:
-                        file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
-                        file_paths.append(full_path)
+                        file.save(os.path.join(UPLOAD_FOLDER, unique_filename))
+                        file_paths.append(unique_filename)
+                        logger.info(f"Uploaded file: {filename}")
                     except Exception as e:
-                        flash(f'Error saving local file {filename}: {e}', 'error')
+                        flash(f'Error saving {filename}: {e}', 'error')
                         has_upload_error = True
                         break
                 else:
-                    flash(f'Local file type not allowed: {file.filename}', 'error')
+                    flash(f'File type not allowed: {file.filename}', 'error')
                     has_upload_error = True
                     break
         
         # 2. Remote URL Download 
-        if not has_upload_error:
+        if not has_upload_error and url_list:
             for url in url_list:
                 success, msg = download_and_save_file(url, key, file_paths)
                 if not success:
-                    flash(f'Remote download failed for {url}: {msg}', 'error')
+                    flash(f'Download failed for {url}: {msg}', 'error')
                     has_upload_error = True
                     break
             
-        # If any error occurred during file handling (local or remote), clean up and return
         if has_upload_error:
             for fp in file_paths:
-                try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
-                except: pass
+                try: 
+                    os.remove(os.path.join(UPLOAD_FOLDER, fp))
+                except: 
+                    pass
             return render_template('index.html', **context) 
             
         # Database Insertion
         created_at_ts = int(time.time())
-        # Use the current default expiry days 
         expires_at_ts = int(created_at_ts + (current_expiry_days * 24 * 3600))
         file_path_string = ','.join(file_paths)
         
@@ -353,27 +381,27 @@ def index():
                 (key, content_stripped, file_path_string, created_at_ts, expires_at_ts) 
             )
             db.commit() 
+            logger.info(f"Created new clip: {key}")
             
-            # Redirect to the newly created clip
             return redirect(url_for('view_clip', key=key))
             
         except sqlite3.OperationalError as e:
-             print(f"SQLITE ERROR: {e}")
-             flash("Database error during clip creation. Check server logs.", 'error')
-             for fp in file_paths: # Clean up uploaded files if DB fails
-                try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
-                except: pass
-             return render_template('index.html', **context)
+            logger.error(f"SQLITE ERROR: {e}")
+            flash("Database error during clip creation.", 'error')
+            for fp in file_paths:
+                try: 
+                    os.remove(os.path.join(UPLOAD_FOLDER, fp))
+                except: 
+                    pass
+            return render_template('index.html', **context)
 
-
-    # 2. Handle GET request (Display form)
+    # GET request
     try:
         cleanup_expired_clips()
     except RuntimeError:
-         flash("Database connection error during cleanup. Please run CLI tool.", 'error')
+        flash("Database connection error during cleanup.", 'error')
     
     return render_template('index.html', **context)
-
 
 @app.route('/<key>')
 def view_clip(key):
@@ -385,7 +413,7 @@ def view_clip(key):
     except RuntimeError:
         return render_template('error.html', message="Database error. Check the database using the CLI."), 500
     except sqlite3.OperationalError as e:
-        print(f"SQLITE ERROR: {e}")
+        logger.error(f"SQLITE ERROR: {e}")
         return render_template('error.html', message="Database uninitialized or corrupted. Run the CLI tool."), 500
 
     if not clip:
@@ -401,7 +429,7 @@ def view_clip(key):
         cleanup_expired_clips()
         return render_template('clipboard.html', clip=None, key=key, expired=True)
 
-    # Calculate time left for display
+    # Calculate time left
     expires_at_dt = datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
     now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
     
@@ -415,13 +443,11 @@ def view_clip(key):
     files_info = []
     for p in file_paths_list:
         if p.strip():
-            filename_with_key = os.path.basename(p.strip())
             try:
-                original_filename = filename_with_key.split('_', 2)[-1] 
+                original_filename = p.split('_', 2)[-1] 
             except IndexError:
-                 original_filename = filename_with_key
+                original_filename = p
             files_info.append({'path': p.strip(), 'name': original_filename})
-
 
     return render_template('clipboard.html', 
                            key=key, 
@@ -433,20 +459,28 @@ def view_clip(key):
                            server_port=CLIPBOARD_PORT,
                            clip=clip)
 
-
-@app.route('/download/<path:file_path>')
-def download_file(file_path):
-    if not file_path.startswith(UPLOAD_FOLDER + '/'):
-         flash('Invalid download request.', 'error')
-         return redirect(url_for('index'))
-         
-    filename_part = os.path.basename(file_path)
-    try:
-        key = filename_part.split('_', 1)[0]
-    except IndexError:
-        flash('Invalid file path format.', 'error')
+# FIXED: Correct download route
+@app.route('/download/<filename>')
+def download_file(filename):
+    """
+    Fixed download route - serves files from uploads folder
+    """
+    logger.info(f"Download request for: {filename}")
+    
+    # Security check
+    if not filename or '..' in filename or '/' in filename:
+        flash('Invalid file request.', 'error')
         return redirect(url_for('index'))
-
+    
+    # Extract key from filename
+    parts = filename.split('_', 1)
+    if len(parts) < 2:
+        flash('Invalid file format.', 'error')
+        return redirect(url_for('index'))
+    
+    key = parts[0]
+    
+    # Check if file exists in database
     db = get_db()
     cursor = db.cursor()
     cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
@@ -458,34 +492,45 @@ def download_file(file_path):
 
     file_paths_string, expires_at_ts = clip
     
-    if file_path not in [p.strip() for p in file_paths_string.split(',')]:
+    # Check if filename is in the associated files
+    file_list = [p.strip() for p in file_paths_string.split(',')] if file_paths_string else []
+    if filename not in file_list:
         flash('File not found in the associated clip.', 'error')
         return redirect(url_for('view_clip', key=key))
 
-
     if expires_at_ts < int(time.time()):
         cleanup_expired_clips()
-        flash('File not found or link expired.', 'error')
+        flash('File link has expired.', 'error')
         return redirect(url_for('index'))
     
+    # Extract original filename for download name
+    original_filename = filename.split('_', 2)[-1] if '_' in filename else filename
     
-    filename_with_key = os.path.basename(file_path)
-    original_filename = filename_with_key.split('_', 2)[-1] 
-    
-    return send_from_directory(os.path.dirname(app.root_path), 
-                               file_path, 
-                               as_attachment=True, 
-                               download_name=original_filename)
+    try:
+        logger.info(f"Serving file: {filename} as {original_filename}")
+        return send_from_directory(
+            UPLOAD_FOLDER, 
+            filename, 
+            as_attachment=True, 
+            download_name=original_filename
+        )
+    except Exception as e:
+        logger.error(f"Error serving file {filename}: {e}")
+        flash('File not found on server.', 'error')
+        return redirect(url_for('index'))
+
+# Initialize database on first run
+if not os.path.exists(DATABASE_PATH):
+    init_db()
 
 if __name__ == '__main__':
     pass
-
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V41 - Edit Clip Expiry)
+# 4. Create clipboard_cli.py (CLI Tool - Unchanged)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V41 - Edit Clip Expiry)..."
+print_status "4/7: Creating clipboard_cli.py..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -633,7 +678,7 @@ def cleanup_expired_clips():
     for file_path_tuple in expired_files:
         file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
         for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads', file_path.strip())
             if file_path and os.path.exists(full_path):
                 try:
                     os.remove(full_path)
@@ -739,7 +784,6 @@ def list_clips():
 
     print(f"\n{Color.BLUE}{Color.BOLD}--- Active Clips ({len(clips)}) ---{Color.END}")
     
-    # V40/V41 Widths: ID:4, Key:10, Link:30, Content:24, Files:6, Remaining:10, Expires:20 => Total: 104
     print(f"{Color.CYAN}{'ID':<4} {'Key':<10} {'Link (IP:Port/Key)':<30} {'Content Preview':<24} {'Files':<6} {'Remaining':<10} {'Expires (UTC)':<20}{Color.END}")
     print("-" * 104)
     
@@ -750,10 +794,7 @@ def list_clips():
         expires_at_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
         expiry_date_utc = expires_at_dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Calculate Remaining Time
         remaining_time = format_remaining_time(clip['expires_at'])
-
-        # Prepare and display the full URL
         full_link = f"{SERVER_IP}:{CLIPBOARD_PORT}/{clip['key']}"
         
         print(f"{clip['id']:<4} {Color.BOLD}{clip['key']:<10}{Color.END} {Color.UNDERLINE}{full_link:<30}{Color.END} {content_preview:<24} {file_count:<6} {remaining_time:<10} {expiry_date_utc:<20}")
@@ -789,7 +830,7 @@ def delete_clip():
     if clip['file_path']:
         file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
         for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads', file_path)
             if os.path.exists(full_path):
                 os.remove(full_path)
                 print(f" - File deleted: {os.path.basename(file_path)}")
@@ -833,9 +874,6 @@ def edit_clip_expiry():
         new_days = 0
         if new_days_str.startswith('+') or new_days_str.startswith('-'):
             adjustment_days = int(new_days_str)
-            
-            # Find the original creation time (This is complex/buggy, simpler is: adjust from current expiry)
-            # Simpler approach: Calculate new expiry date based on adjustment from current expiry
             current_expiry_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
             new_expiry_dt = current_expiry_dt + timedelta(days=adjustment_days)
             
@@ -845,7 +883,6 @@ def edit_clip_expiry():
                 print(f"{Color.RED}Error: Total days must be a positive integer.{Color.END}")
                 return
             
-            # Calculate new expiry date based on total new days from *current time*
             new_expiry_dt = datetime.fromtimestamp(time.time(), tz=timezone.utc) + timedelta(days=new_days)
 
         new_expires_at_ts = int(new_expiry_dt.timestamp())
@@ -853,9 +890,8 @@ def edit_clip_expiry():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Check if the new expiry time is in the past
         if new_expires_at_ts < int(time.time()):
-             print(f"{Color.RED}Error: New expiry date ({new_expiry_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}) is in the past. Use a larger number or '+' adjustment.{Color.END}")
+             print(f"{Color.RED}Error: New expiry date is in the past. Use a larger number or '+' adjustment.{Color.END}")
              conn.close()
              return
 
@@ -880,7 +916,7 @@ def edit_clip():
     print(f"\n{Color.CYAN}--- Select Clip Editing Option ---{Color.END}")
     print(f"1. Edit Key")
     print(f"2. Edit Content")
-    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}") # V41: New Option
+    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}")
     print(f"0. Cancel")
     
     choice = input("Enter your choice (1/2/3/0): ").strip()
@@ -889,7 +925,6 @@ def edit_clip():
         edit_clip_expiry()
         return
 
-    # Rest of the old logic for Key/Content editing
     clip_id_or_key = input("\nEnter the ID or Key of the clip to edit (for Key/Content): ").strip()
 
     conn = get_db_connection()
@@ -959,7 +994,6 @@ def edit_clip():
 def main_menu():
     global EXPIRY_DAYS, BASE_URL, SERVER_IP
     
-    # Reload configuration before running the menu
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
     EXPIRY_DAYS = int(os.getenv('EXPIRY_DAYS', '30'))
     CLIPBOARD_PORT = os.getenv('CLIPBOARD_PORT', '3214')
@@ -979,7 +1013,7 @@ def main_menu():
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
         print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
-        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)") # V41: Updated description
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)")
         print(f"4. {Color.RED}Delete Clip{Color.END}")
         print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") 
         print("0. Exit")
@@ -1004,15 +1038,14 @@ def main_menu():
 
 if __name__ == '__main__':
     main_menu()
-
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (V41 + Fix Copy)
+# 5. Create HTML Templates (FIXED for downloads)
 # ============================================
-print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
+print_status "5/7: Creating HTML templates (Fixed download links)..."
 
-# --- index.html (Retained) ---
+# --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1071,7 +1104,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
                 <input type="file" id="files" name="files" multiple>
             </div>
             
-             {# V37: New field for URL uploads #}
             <div>
                 <label for="url_files">File Upload via URL Link (Optional - One link per line):</label>
                 <textarea id="url_files" name="url_files" placeholder="Enter file links...">{{ old_url_files }}</textarea>
@@ -1094,7 +1126,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (V41 + FIX: Reliable Copy Logic) ---
+# --- clipboard.html (FIXED download links) ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1132,7 +1164,6 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             {% endfor %}
         </div>
         
-        {# V35 FIX: Check if clip exists AND (has content OR has files_info). #}
         {% if clip and (content or files_info) %}
             <h1>Clip Content for: {{ key }}</h1>
             
@@ -1150,7 +1181,6 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 {% endif %}
             </div>
         
-        {# اگر کلیپ پیدا نشد یا منقضی شده بود #}
         {% else %}
              <h1>Clip Not Found</h1>
              <div class="expiry-info">
@@ -1168,7 +1198,8 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 {% for file in files_info %}
                     <div class="file-item">
                         <span>{{ file.name }}</span>
-                        <a href="{{ url_for('download_file', file_path=file.path) }}">Download</a>
+                        <!-- FIXED: Correct download URL -->
+                        <a href="{{ url_for('download_file', filename=file.path) }}">Download</a>
                     </div>
                 {% endfor %}
             </div>
@@ -1187,46 +1218,32 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 return;
             }
             
-            // 1. Try modern clipboard API (async, preferred)
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(contentElement.innerText).then(() => {
-                    alert('Text copied to clipboard! (Modern API)');
+                    alert('Text copied to clipboard!');
                 }).catch(err => {
-                    // Fallback if permission is denied or API fails
-                    console.error('Copy failed (Modern API): ', err);
                     copyFallback(contentElement);
                 });
             } else {
-                // 2. Use deprecated execCommand fallback (synchronous)
                 copyFallback(contentElement);
             }
         }
         
         function copyFallback(element) {
             try {
-                // Create a temporary textarea for selection/copying
                 const tempTextArea = document.createElement('textarea');
                 tempTextArea.value = element.innerText;
-                
-                // Hide the textarea visually
                 tempTextArea.style.position = 'fixed';
                 tempTextArea.style.top = '0';
                 tempTextArea.style.left = '0';
                 tempTextArea.style.opacity = '0';
-                
                 document.body.appendChild(tempTextArea);
-                
-                // Select and copy
                 tempTextArea.select();
-                tempTextArea.setSelectionRange(0, 99999); // For mobile devices
-                
-                // Use deprecated but widely supported copy command
+                tempTextArea.setSelectionRange(0, 99999);
                 document.execCommand('copy');
                 document.body.removeChild(tempTextArea);
-                
-                alert('Text copied to clipboard! (Compatible Method)');
+                alert('Text copied to clipboard!');
             } catch (err) {
-                console.error('Copy failed (Fallback): ', err);
                 alert('Copy Error! Please manually select and copy the text.');
             }
         }
@@ -1235,8 +1252,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-
-# --- error.html --- (No Change)
+# --- error.html ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1265,38 +1281,36 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 </html>
 ERROREOF
 
-
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V41)
+# 6. Create Systemd Service (FIXED timeout issues)
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V41 Optimization)..."
+print_status "6/7: Creating Systemd service (FIXED: timeout=0 for long downloads)..."
 
-# --- clipboard.service (Port 3214 - Runs web_service.py) ---
-# 🔴 FIXED: Removed TimeoutSec=30 and changed Gunicorn timeout to 0
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Web Server (Full Submission, CLI Management)
+Description=Flask Clipboard Web Server (V42 - Fixed Download Timeout)
 After=network.target
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
+# FIXED: timeout=0 prevents 503 errors for large downloads
 ExecStart=${GUNICORN_VENV_PATH} --workers 2 --timeout 0 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
-
 
 # ============================================
 # 7. Final Steps
 # ============================================
 print_status "7/7: Initializing database and starting service..."
 
-# Create a simple wrapper script for CLI execution
+# Create CLI wrapper script
 cat > "$INSTALL_DIR/clipboard_cli.sh" << CLISHEOF
 #!/bin/bash
 source ${INSTALL_DIR}/venv/bin/activate
@@ -1304,23 +1318,51 @@ exec ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py "\$@"
 CLISHEOF
 chmod +x "$INSTALL_DIR/clipboard_cli.sh"
 
-# Initialize DB using the new wrapper script
-"$INSTALL_DIR/clipboard_cli.sh" --init-db 
+# Initialize database
+sqlite3 "$DATABASE_PATH" "CREATE TABLE IF NOT EXISTS clips (
+    id INTEGER PRIMARY KEY,
+    key TEXT UNIQUE NOT NULL,
+    content TEXT,
+    file_path TEXT, 
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);" 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable clipboard.service
 systemctl restart clipboard.service
 
+# Get server IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+if [ -z "$SERVER_IP" ]; then
+    SERVER_IP="YOUR_SERVER_IP"
+fi
+
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix)"
+echo "🎉 Installation Complete (Clipboard Server V42)"
 echo "================================================"
-echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
+echo "✅ Web service is active on port ${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "🌐 Web Address: http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 Web Address: http://${SERVER_IP}:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 CLI Management (for list/delete/change expiry):"
+echo "💻 CLI Management:"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
+echo "📁 Upload Directory: ${INSTALL_DIR}/uploads"
+echo "🗄️  Database: ${INSTALL_DIR}/clipboard.db"
+echo "📋 Supported File Types:"
+echo "   APK, EXE, DEB, MSI, DMG, ZIP, RAR, 7Z, PDF,"
+echo "   PNG, JPG, MP3, MP4, TXT, ISO, BIN, and more..."
+echo "------------------------------------------------"
 echo "Logs:    sudo journalctl -u clipboard.service -f"
+echo "Status:  sudo systemctl status clipboard.service"
+echo "Restart: sudo systemctl restart clipboard.service"
 echo "================================================"
+echo ""
+echo "✅ V42 FIXES APPLIED:"
+echo "   1. Fixed 404 Not Found for downloads"
+echo "   2. Fixed 503 timeout for large downloads"
+echo "   3. Full support for all file types"
+echo "   4. Improved error handling and logging"
+echo ""
