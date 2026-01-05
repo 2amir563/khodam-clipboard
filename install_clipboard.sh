@@ -2,6 +2,7 @@
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
 # V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
 # FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
+# MOD: Enhanced download methods with fallback for 503 errors
 
 set -e
 
@@ -31,7 +32,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix)"
+echo "📋 Internet Clipboard Server Installer (V41 + Download Fix for 503)"
 echo "=================================================="
 
 # ============================================
@@ -96,9 +97,9 @@ fi
 
 
 # ============================================
-# 3. Create web_service.py (V37/V41 Logic - Retained)
+# 3. Create web_service.py (V37/V41 Logic - Retained with Smart Download)
 # ============================================
-print_status "3/7: Creating web_service.py (V41 Logic - Retained)..."
+print_status "3/7: Creating web_service.py (V41 Logic - Smart download with multiple methods)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -106,6 +107,7 @@ import re
 import string
 import random
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
@@ -124,7 +126,31 @@ UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
+# MOD: Extended list of allowed file extensions (removed restrictions)
+ALLOWED_EXTENSIONS = {
+    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'svg', 'webp', 'tiff', 'psd',
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg', 
+    'mp3', 'mp4', 'avi', 'mkv', 'mov', 'wmv', 'flv', 'webm', 'm4a', 'wav', 'ogg', 'flac',
+    'exe', 'msi', 'apk', 'deb', 'rpm', 'apks', 'xapk', 'appimage',
+    'bin', 'dll', 'so', 'dylib', 'sys', 'drv',
+    'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+    'html', 'htm', 'css', 'js', 'json', 'xml', 'csv', 'sql', 'py', 'java', 'cpp', 'c', 'h',
+    'ps1', 'bat', 'sh', 'bash', 'zsh', 'fish',
+    'ttf', 'otf', 'woff', 'woff2', 'eot',
+    'torrent', 'md', 'rst', 'log', 'ini', 'conf', 'cfg', 'yml', 'yaml',
+    'key', 'pem', 'crt', 'cer', 'pfx', 'p12',
+    'db', 'sqlite', 'sqlite3', 'mdb', 'accdb',
+    'sketch', 'fig', 'xd', 'ai', 'ps', 'eps',
+    '3ds', 'obj', 'fbx', 'stl', 'blend', 'ma', 'mb',
+    'vmdk', 'vhd', 'vhdx', 'ova', 'ovf',
+    'epub', 'mobi', 'azw', 'azw3', 'fb2',
+    'heic', 'heif', 'cr2', 'nef', 'arw', 'orf',
+    'swf', 'swc', 'fla', 'as', 'mxml',
+    'lua', 'pl', 'pm', 'tcl', 'rb', 'go', 'rs', 'php', 'asp', 'aspx',
+    'djvu', 'xps', 'oxps', 'ps', 'eps', 'ai',
+    'pkg', 'run', 'sh', 'bash', 'zsh', 'fish',
+    'reg', 'inf', 'cat', 'msc', 'msi', 'msp', 'mst'
+}
 
 # --- Utility Functions ---
 def get_db():
@@ -188,60 +214,173 @@ def cleanup_expired_clips():
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     db.commit() 
 
+def get_alternative_download_methods(url):
+    """
+    Returns alternative methods to download files when direct download fails.
+    This is useful for sites like p30download that block direct access.
+    """
+    methods = []
+    
+    # Method 1: Try with different user agents
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ]
+    
+    for ua in user_agents:
+        methods.append({
+            'type': 'direct_with_ua',
+            'headers': {
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Cache-Control': 'max-age=0'
+            },
+            'verify': False
+        })
+    
+    # Method 2: For p30download links specifically
+    if 'p30download' in url:
+        # Try to extract file ID and use alternative methods
+        file_id_match = re.search(r'/([a-zA-Z0-9_]+)_p30download\.com\.', url)
+        if file_id_match:
+            file_id = file_id_match.group(1)
+            # Alternative method 1: Use file.io API as fallback
+            methods.append({
+                'type': 'fileio_api',
+                'url': f'https://file.io/?url={urllib.parse.quote(url)}',
+                'headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+            })
+            
+            # Alternative method 2: Use savefrom.net service
+            methods.append({
+                'type': 'savefrom_api',
+                'url': f'https://savefrom.net/downloader?url={urllib.parse.quote(url)}',
+                'headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://savefrom.net/'
+                }
+            })
+    
+    return methods
+
 def download_and_save_file(url, key, file_paths):
     """
-    Downloads a file from a URL, saves it, and updates file_paths list.
+    Downloads a file from a URL using multiple methods with fallback.
     Returns: (bool success, str message)
     """
     try:
         # Basic URL validation
         if not url.lower().startswith(('http://', 'https://')):
             return False, "URL must start with http:// or https://."
-            
-        # Disable excessive redirects for security/performance
-        response = requests.get(url, allow_redirects=True, stream=True, timeout=30)
         
-        if response.status_code != 200:
-            return False, f"HTTP Error {response.status_code} when accessing URL."
+        # Try direct download first with standard headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+            'Referer': 'https://www.google.com/',
+            'DNT': '1'
+        }
+        
+        # Get alternative download methods
+        alternative_methods = get_alternative_download_methods(url)
+        
+        # Try all methods including direct download
+        all_methods = [{'type': 'direct', 'headers': headers, 'verify': False}] + alternative_methods
+        
+        last_error = None
+        
+        for i, method in enumerate(all_methods):
+            try:
+                print(f"[DEBUG] Trying download method {i+1}/{len(all_methods)}: {method.get('type', 'unknown')}")
+                
+                if method['type'] == 'direct' or method['type'] == 'direct_with_ua':
+                    response = requests.get(
+                        url, 
+                        headers=method.get('headers', headers),
+                        allow_redirects=True, 
+                        stream=True, 
+                        timeout=30,
+                        verify=method.get('verify', False)
+                    )
+                    
+                    if response.status_code == 200:
+                        # Success! Process the file
+                        return process_downloaded_file(response, url, key, file_paths)
+                    elif response.status_code == 503:
+                        last_error = f"Method {method['type']}: Server unavailable (503). Trying next method..."
+                        continue
+                    elif response.status_code == 403:
+                        last_error = f"Method {method['type']}: Access forbidden (403). Trying next method..."
+                        continue
+                    else:
+                        last_error = f"Method {method['type']}: HTTP {response.status_code}. Trying next method..."
+                        continue
+                        
+                elif method['type'] in ['fileio_api', 'savefrom_api']:
+                    # For API-based methods, we need a different approach
+                    # For now, skip these as they require more complex handling
+                    last_error = f"API method {method['type']} requires manual implementation. Skipping..."
+                    continue
+                    
+            except requests.exceptions.Timeout:
+                last_error = f"Method {method.get('type', 'unknown')}: Timeout. Trying next method..."
+                continue
+            except requests.exceptions.RequestException as e:
+                last_error = f"Method {method.get('type', 'unknown')}: {str(e)[:100]}... Trying next method..."
+                continue
+        
+        # If all methods failed
+        return False, f"All download methods failed. Last error: {last_error}\n\nFor p30download links, try:\n1. Use a VPN or proxy\n2. Download manually and upload directly\n3. Try a different download source"
+        
+    except Exception as e:
+        return False, f"Unexpected error during download: {str(e)}"
 
-        # Determine filename from URL or Content-Disposition
-        content_disposition = response.headers.get('Content-Disposition')
-        if content_disposition:
-            # Try to extract filename from Content-Disposition header
-            fname_match = re.search(r'filename="?([^"]+)"?', content_disposition)
-            if fname_match:
-                filename = fname_match.group(1)
-            else:
-                 filename = os.path.basename(url.split('?', 1)[0])
+def process_downloaded_file(response, url, key, file_paths):
+    """Process a successful download response."""
+    # Determine filename from URL or Content-Disposition
+    content_disposition = response.headers.get('Content-Disposition')
+    if content_disposition:
+        # Try to extract filename from Content-Disposition header
+        fname_match = re.search(r'filename="?([^"]+)"?', content_disposition)
+        if fname_match:
+            filename = fname_match.group(1)
         else:
             filename = os.path.basename(url.split('?', 1)[0])
-            
-        if not filename or filename == '.':
-             filename = "downloaded_file" 
+    else:
+        filename = os.path.basename(url.split('?', 1)[0])
         
-        # Simple extension check
-        if not allowed_file(filename):
-            return False, f"File type not allowed for downloaded file: {filename}"
-        
-        filename = secure_filename(filename)
-        unique_filename = f"{key}_{filename}"
-        full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-        
-        # Save file to disk
-        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
-        with open(local_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+    if not filename or filename == '.':
+        filename = "downloaded_file" 
+    
+    # Simple extension check
+    if not allowed_file(filename):
+        return False, f"File type not allowed for downloaded file: {filename}"
+    
+    filename = secure_filename(filename)
+    unique_filename = f"{key}_{filename}"
+    full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+    
+    # Save file to disk
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
+    with open(local_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-        file_paths.append(full_path)
-        return True, filename
-
-    except requests.exceptions.Timeout:
-        return False, "Download failed: Connection timed out (30 seconds limit)."
-    except requests.exceptions.RequestException as e:
-        return False, f"Download failed: {e}"
-    except Exception as e:
-        return False, f"An unexpected error occurred during download: {e}"
+    file_paths.append(full_path)
+    return True, filename
 
 
 # --- Main Routes ---
@@ -1011,7 +1150,7 @@ PYEOF_CLI_TOOL
 # ============================================
 print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
 
-# --- index.html (Retained) ---
+# --- index.html (Updated with download tips) ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1025,6 +1164,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
         .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
         .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
         form div { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
         textarea, input[type="text"], input[type="file"] { 
@@ -1047,6 +1187,9 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         }
         input[type="submit"]:hover { background-color: #4cae4c; }
         .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
+        .download-tips { margin-top: 20px; padding: 15px; background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; color: #856404; font-size: 0.9em;}
+        .download-tips h3 { margin-top: 0; color: #856404; }
+        .download-tips ul { margin-bottom: 0; padding-left: 20px; }
     </style>
 </head>
 <body>
@@ -1059,6 +1202,10 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             {% endfor %}
         </div>
         
+        <div class="flash info">
+            <strong>Note about URL downloads:</strong> Some sites (like p30download) may block direct downloads. If URL download fails, try uploading files directly.
+        </div>
+        
         <form method="POST" enctype="multipart/form-data">
             <div>
                 <label for="content">Text Content (Optional):</label>
@@ -1066,7 +1213,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             </div>
             
             <div>
-                <label for="files">Local File Upload (Optional):</label>
+                <label for="files">Local File Upload (Optional - Recommended):</label>
                 <input type="file" id="files" name="files" multiple>
             </div>
             
@@ -1083,6 +1230,16 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             
             <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
         </form>
+        
+        <div class="download-tips">
+            <h3>📝 Download Tips:</h3>
+            <ul>
+                <li>For p30download links: Use a VPN or download manually first</li>
+                <li>For blocked sites: Upload files directly instead of using URLs</li>
+                <li>Large files: Use direct upload for better reliability</li>
+                <li>File types: All common file types are supported</li>
+            </ul>
+        </div>
         
         <div class="cli-note">
             ⚠️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
@@ -1312,7 +1469,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix)"
+echo "🎉 Installation Complete (Clipboard Server V41 + Download Fix for 503)"
 echo "================================================"
 echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
 echo "------------------------------------------------"
@@ -1320,6 +1477,10 @@ echo "🌐 Web Address: http://YOUR_IP:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
 echo "💻 CLI Management (for list/delete/change expiry):"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
+echo "------------------------------------------------"
+echo "📝 Note: For sites like p30download that return 503 errors:"
+echo "   • Use direct file upload instead of URL links"
+echo "   • Or use a VPN/proxy for URL downloads"
 echo "------------------------------------------------"
 echo "Logs:    sudo journalctl -u clipboard.service -f"
 echo "================================================"
