@@ -2,7 +2,6 @@
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
 # V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
 # FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
-# MOD: Increased timeout to 5000s, added more file extensions, and improved HTTP headers for 503 errors
 
 set -e
 
@@ -32,7 +31,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix + Enhanced HTTP Headers)"
+echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix)"
 echo "=================================================="
 
 # ============================================
@@ -97,9 +96,9 @@ fi
 
 
 # ============================================
-# 3. Create web_service.py (V37/V41 Logic - Retained with Enhanced HTTP)
+# 3. Create web_service.py (V37/V41 Logic - Retained)
 # ============================================
-print_status "3/7: Creating web_service.py (V41 Logic - Enhanced HTTP headers for 503 fix)..."
+print_status "3/7: Creating web_service.py (V41 Logic - Retained)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -125,31 +124,7 @@ UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-# MOD: Extended list of allowed file extensions (removed restrictions)
-ALLOWED_EXTENSIONS = {
-    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'svg', 'webp', 'tiff', 'psd',
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg', 
-    'mp3', 'mp4', 'avi', 'mkv', 'mov', 'wmv', 'flv', 'webm', 'm4a', 'wav', 'ogg', 'flac',
-    'exe', 'msi', 'apk', 'deb', 'rpm', 'apks', 'xapk', 'appimage',
-    'bin', 'dll', 'so', 'dylib', 'sys', 'drv',
-    'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
-    'html', 'htm', 'css', 'js', 'json', 'xml', 'csv', 'sql', 'py', 'java', 'cpp', 'c', 'h',
-    'ps1', 'bat', 'sh', 'bash', 'zsh', 'fish',
-    'ttf', 'otf', 'woff', 'woff2', 'eot',
-    'torrent', 'md', 'rst', 'log', 'ini', 'conf', 'cfg', 'yml', 'yaml',
-    'key', 'pem', 'crt', 'cer', 'pfx', 'p12',
-    'db', 'sqlite', 'sqlite3', 'mdb', 'accdb',
-    'sketch', 'fig', 'xd', 'ai', 'ps', 'eps',
-    '3ds', 'obj', 'fbx', 'stl', 'blend', 'ma', 'mb',
-    'vmdk', 'vhd', 'vhdx', 'ova', 'ovf',
-    'epub', 'mobi', 'azw', 'azw3', 'fb2',
-    'heic', 'heif', 'cr2', 'nef', 'arw', 'orf',
-    'swf', 'swc', 'fla', 'as', 'mxml',
-    'lua', 'pl', 'pm', 'tcl', 'rb', 'go', 'rs', 'php', 'asp', 'aspx',
-    'djvu', 'xps', 'oxps', 'ps', 'eps', 'ai',
-    'pkg', 'run', 'sh', 'bash', 'zsh', 'fish',
-    'reg', 'inf', 'cat', 'msc', 'msi', 'msp', 'mst'
-}
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 'mp3', 'mp4', 'exe', 'bin', 'iso'}
 
 # --- Utility Functions ---
 def get_db():
@@ -222,33 +197,12 @@ def download_and_save_file(url, key, file_paths):
         # Basic URL validation
         if not url.lower().startswith(('http://', 'https://')):
             return False, "URL must start with http:// or https://."
-        
-        # Enhanced headers to mimic a real browser and avoid 503 errors
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0',
-            'Referer': 'https://www.google.com/',
-            'DNT': '1'
-        }
             
-        # MOD: Increased timeout from 30 to 5000 seconds for large files
-        # Added verify=False for SSL issues, but use with caution
-        response = requests.get(
-            url, 
-            headers=headers,
-            allow_redirects=True, 
-            stream=True, 
-            timeout=5000,
-            verify=False  # Added for SSL certificate issues
-        )
+        # Disable excessive redirects for security/performance
+        response = requests.get(url, allow_redirects=True, stream=True, timeout=30)
         
         if response.status_code != 200:
-            return False, f"HTTP Error {response.status_code} when accessing URL. Server may be blocking the request."
+            return False, f"HTTP Error {response.status_code} when accessing URL."
 
         # Determine filename from URL or Content-Disposition
         content_disposition = response.headers.get('Content-Disposition')
@@ -283,57 +237,9 @@ def download_and_save_file(url, key, file_paths):
         return True, filename
 
     except requests.exceptions.Timeout:
-        return False, "Download failed: Connection timed out (5000 seconds limit)."
-    except requests.exceptions.SSLError as e:
-        # Try again without SSL verification if SSL error occurs
-        try:
-            print(f"[WARNING] SSL Error occurred, retrying without verification: {e}")
-            response = requests.get(
-                url, 
-                headers=headers,
-                allow_redirects=True, 
-                stream=True, 
-                timeout=5000,
-                verify=False
-            )
-            if response.status_code == 200:
-                # Continue with processing...
-                filename = os.path.basename(url.split('?', 1)[0])
-                if not filename or filename == '.':
-                    filename = "downloaded_file" 
-                
-                if not allowed_file(filename):
-                    return False, f"File type not allowed for downloaded file: {filename}"
-                
-                filename = secure_filename(filename)
-                unique_filename = f"{key}_{filename}"
-                full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-                
-                local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
-                with open(local_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-
-                file_paths.append(full_path)
-                return True, filename
-            else:
-                return False, f"HTTP Error {response.status_code} after SSL retry."
-        except Exception as retry_e:
-            return False, f"SSL Error and retry failed: {retry_e}"
+        return False, "Download failed: Connection timed out (30 seconds limit)."
     except requests.exceptions.RequestException as e:
-        # More detailed error handling
-        if hasattr(e, 'response') and e.response is not None:
-            status_code = e.response.status_code
-            if status_code == 503:
-                return False, "Download failed: Server is temporarily unavailable (503 Service Unavailable). The server may be blocking automated requests. Try again later or use a direct download link."
-            elif status_code == 403:
-                return False, "Download failed: Access forbidden (403). The server may be blocking this type of request."
-            elif status_code == 429:
-                return False, "Download failed: Too many requests (429). Please wait before trying again."
-            else:
-                return False, f"Download failed: HTTP Error {status_code} - {str(e)}"
-        else:
-            return False, f"Download failed: Network error - {str(e)}"
+        return False, f"Download failed: {e}"
     except Exception as e:
         return False, f"An unexpected error occurred during download: {e}"
 
@@ -452,7 +358,7 @@ def index():
             
         except sqlite3.OperationalError as e:
              print(f"SQLITE ERROR: {e}")
-             flash("Database error during clip creation. Check server logs.", 'error")
+             flash("Database error during clip creation. Check server logs.", 'error')
              for fp in file_paths: # Clean up uploaded files if DB fails
                 try: os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), fp))
                 except: pass
@@ -1406,7 +1312,7 @@ systemctl restart clipboard.service
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix + Enhanced HTTP Headers)"
+echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix)"
 echo "================================================"
 echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
 echo "------------------------------------------------"
