@@ -1,8 +1,6 @@
 #!/bin/bash
 # Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V41 - EDIT CLIP EXPIRY: Added option to change the expiry date of a specific clip via the CLI.
-# FIX: Adjusted JavaScript in clipboard.html for reliable text copying when files are present.
-# MOD: Increased timeout to 5000 seconds and removed file type restrictions.
+# V42 - Enhanced Stability: Added better error handling, increased workers, and timeout fixes.
 
 set -e
 
@@ -32,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V41 + Copy Fix + Enhanced File Support)"
+echo "📋 Internet Clipboard Server Installer (V42 - Enhanced Stability)"
 echo "=================================================="
 
 # ============================================
@@ -44,7 +42,7 @@ print_status "1/7: Preparing system, virtual environment, and cleaning old DB...
 systemctl stop clipboard.service 2>/dev/null || true
 
 apt update -y
-apt install -y python3 python3-pip python3-venv curl wget
+apt install -y python3 python3-pip python3-venv curl wget sqlite3
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" 
@@ -59,10 +57,10 @@ GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
 # Ensure dependencies are installed (requests added for URL download)
 cat > requirements.txt << 'REQEOF'
-Flask
-python-dotenv
-gunicorn
-requests
+Flask==2.3.3
+python-dotenv==1.0.0
+gunicorn==21.2.0
+requests==2.31.0
 REQEOF
 pip install -r requirements.txt || true
 deactivate
@@ -85,6 +83,8 @@ SECRET_KEY=${SECRET_KEY}
 EXPIRY_DAYS=${EXPIRY_DAYS}
 CLIPBOARD_PORT=${CLIPBOARD_PORT}
 DOTENV_FULL_PATH=${INSTALL_DIR}/.env
+FLASK_ENV=production
+GUNICORN_WORKERS=2
 ENVEOF
 else
     # Update/Ensure keys exist
@@ -93,13 +93,19 @@ else
         echo "EXPIRY_DAYS=${EXPIRY_DAYS}" >> "$INSTALL_DIR/.env"
     fi
     sed -i "/^DOTENV_FULL_PATH=/c\DOTENV_FULL_PATH=${INSTALL_DIR}/.env" "$INSTALL_DIR/.env"
+    if ! grep -q "FLASK_ENV" "$INSTALL_DIR/.env"; then
+        echo "FLASK_ENV=production" >> "$INSTALL_DIR/.env"
+    fi
+    if ! grep -q "GUNICORN_WORKERS" "$INSTALL_DIR/.env"; then
+        echo "GUNICORN_WORKERS=2" >> "$INSTALL_DIR/.env"
+    fi
 fi
 
 
 # ============================================
-# 3. Create web_service.py (V37/V41 Logic - Modified)
+# 3. Create web_service.py (Enhanced Stability Version)
 # ============================================
-print_status "3/7: Creating web_service.py (V41 Logic - Enhanced File Support)..."
+print_status "3/7: Creating web_service.py (Enhanced Stability)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -125,7 +131,7 @@ UPLOAD_FOLDER = 'uploads'
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-# MOD: Removed file type restrictions - allow all file types
+# Allow all file types - no restrictions
 ALLOWED_EXTENSIONS = set()
 
 # --- Utility Functions ---
@@ -143,7 +149,33 @@ def get_db():
             db.execute('PRAGMA foreign_keys=ON') 
         except sqlite3.OperationalError as e:
             print(f"[FATAL] Could not connect to database at {DATABASE_PATH}: {e}")
-            raise RuntimeError("Database connection failed.")
+            # Create database if doesn't exist
+            try:
+                os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+                db = g._database = sqlite3.connect(
+                    DATABASE_PATH, 
+                    timeout=10, 
+                    check_same_thread=False,
+                    isolation_level=None 
+                )
+                db.row_factory = sqlite3.Row 
+                db.execute('PRAGMA foreign_keys=ON') 
+                # Initialize database tables
+                cursor = db.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS clips (
+                        id INTEGER PRIMARY KEY,
+                        key TEXT UNIQUE NOT NULL,
+                        content TEXT,
+                        file_path TEXT, 
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )
+                """)
+                db.commit()
+            except Exception as e2:
+                print(f"[FATAL] Could not create database: {e2}")
+                raise RuntimeError("Database connection failed.")
     return db
 
 @app.teardown_appcontext
@@ -153,7 +185,7 @@ def close_connection(exception):
         db.close()
 
 def allowed_file(filename):
-    # MOD: Allow all file types - no restrictions
+    # Allow all file types - no restrictions
     return '.' in filename  # Only check if there's an extension
 
 def generate_key(length=8):
@@ -168,27 +200,30 @@ def generate_key(length=8):
             return key
 
 def cleanup_expired_clips():
-    db = get_db()
-    cursor = db.cursor()
-    now_ts = int(time.time()) 
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        now_ts = int(time.time()) 
 
-    # Delete associated files
-    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
-    expired_files = cursor.fetchall()
+        # Delete associated files
+        cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
+        expired_files = cursor.fetchall()
 
-    for file_path_tuple in expired_files:
-        file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
-        for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
-            if file_path and os.path.exists(full_path):
-                try:
-                    os.remove(full_path)
-                except OSError as e:
-                    print(f"[WARNING] Error removing file {full_path}: {e}")
-            
-    # Delete database entries
-    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
-    db.commit() 
+        for file_path_tuple in expired_files:
+            file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
+            for file_path in file_paths:
+                full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+                if file_path and os.path.exists(full_path):
+                    try:
+                        os.remove(full_path)
+                    except OSError as e:
+                        print(f"[WARNING] Error removing file {full_path}: {e}")
+                
+        # Delete database entries
+        cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
+        db.commit()
+    except Exception as e:
+        print(f"[ERROR] Failed to cleanup expired clips: {e}")
 
 def download_and_save_file(url, key, file_paths):
     """
@@ -200,7 +235,7 @@ def download_and_save_file(url, key, file_paths):
         if not url.lower().startswith(('http://', 'https://')):
             return False, "URL must start with http:// or https://."
             
-        # MOD: Increased timeout to 5000 seconds for large files
+        # Increased timeout to 5000 seconds for large files
         response = requests.get(url, allow_redirects=True, stream=True, timeout=5000)
         
         if response.status_code != 200:
@@ -221,10 +256,14 @@ def download_and_save_file(url, key, file_paths):
         if not filename or filename == '.':
              filename = "downloaded_file" 
         
-        # MOD: No file type restrictions - allow all files
+        # No file type restrictions - allow all files
         filename = secure_filename(filename)
         unique_filename = f"{key}_{filename}"
         full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        # Ensure upload directory exists
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_FOLDER)
+        os.makedirs(upload_dir, exist_ok=True)
         
         # Save file to disk
         local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path)
@@ -242,6 +281,19 @@ def download_and_save_file(url, key, file_paths):
     except Exception as e:
         return False, f"An unexpected error occurred during download: {e}"
 
+
+# --- Error Handlers ---
+@app.errorhandler(404)
+def not_found(error):
+    return render_template('error.html', message="Page not found."), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return render_template('error.html', message="Internal server error. Please try again later."), 500
+
+@app.errorhandler(503)
+def service_unavailable(error):
+    return render_template('error.html', message="Service temporarily unavailable. Please try again in a moment."), 503
 
 # --- Main Routes ---
 
@@ -296,8 +348,9 @@ def index():
             if cursor.fetchone():
                 flash(f'The key "{key}" is already in use. Please choose another key.', 'error')
                 return render_template('index.html', **context) 
-        except RuntimeError:
-            flash("Database connection error.", 'error')
+        except Exception as e:
+            print(f"[ERROR] Database connection error: {e}")
+            flash("Database connection error. Please try again.", 'error')
             return render_template('index.html', **context) 
             
         # File Handling (Local & Remote)
@@ -307,12 +360,14 @@ def index():
         # 1. Local File Upload
         for file in uploaded_files:
             if file and file.filename:
-                # MOD: Allow all file types - no restrictions
+                # Allow all file types - no restrictions
                 if allowed_file(file.filename):
                     filename = secure_filename(file.filename)
                     unique_filename = f"{key}_{filename}"
                     full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
                     try:
+                        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_FOLDER)
+                        os.makedirs(upload_dir, exist_ok=True)
                         file.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), full_path))
                         file_paths.append(full_path)
                     except Exception as e:
@@ -368,7 +423,8 @@ def index():
     # 2. Handle GET request (Display form)
     try:
         cleanup_expired_clips()
-    except RuntimeError:
+    except Exception as e:
+         print(f"[ERROR] Cleanup failed: {e}")
          flash("Database connection error during cleanup. Please run CLI tool.", 'error')
     
     return render_template('index.html', **context)
@@ -381,11 +437,9 @@ def view_clip(key):
         cursor = db.cursor()
         cursor.execute("SELECT content, file_path, expires_at FROM clips WHERE key = ?", (key,))
         clip = cursor.fetchone()
-    except RuntimeError:
+    except Exception as e:
+        print(f"[ERROR] Database error: {e}")
         return render_template('error.html', message="Database error. Check the database using the CLI."), 500
-    except sqlite3.OperationalError as e:
-        print(f"SQLITE ERROR: {e}")
-        return render_template('error.html', message="Database uninitialized or corrupted. Run the CLI tool."), 500
 
     if not clip:
         return render_template('clipboard.html', clip=None, key=key)
@@ -446,10 +500,15 @@ def download_file(file_path):
         flash('Invalid file path format.', 'error')
         return redirect(url_for('index'))
 
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
-    clip = cursor.fetchone()
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT file_path, expires_at FROM clips WHERE key = ?", (key,))
+        clip = cursor.fetchone()
+    except Exception as e:
+        print(f"[ERROR] Database error: {e}")
+        flash('Database error. Please try again.', 'error')
+        return redirect(url_for('index'))
 
     if not clip:
         flash('File not found or link expired.', 'error')
@@ -482,9 +541,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (The CLI Management Tool - V41 - Edit Clip Expiry)
+# 4. Create clipboard_cli.py (The CLI Management Tool - Enhanced)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (CLI Tool - V41 - Edit Clip Expiry)..."
+print_status "4/7: Creating clipboard_cli.py (CLI Tool - Enhanced)..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -589,9 +648,18 @@ def format_remaining_time(expiry_ts):
 
 # --- Database Management ---
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.OperationalError as e:
+        print(f"{Color.RED}Database connection error: {e}{Color.END}")
+        print(f"{Color.YELLOW}Creating new database...{Color.END}")
+        # Create database directory if it doesn't exist
+        os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+        conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def init_db():
     conn = get_db_connection()
@@ -608,6 +676,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    print(f"{Color.GREEN}Database initialized successfully.{Color.END}")
 
 def generate_key(length=8):
     characters = string.ascii_letters + string.digits
@@ -622,26 +691,29 @@ def generate_key(length=8):
             return key
 
 def cleanup_expired_clips():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    now_ts = int(time.time()) 
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        now_ts = int(time.time()) 
 
-    cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
-    expired_files = cursor.fetchall()
+        cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
+        expired_files = cursor.fetchall()
 
-    for file_path_tuple in expired_files:
-        file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
-        for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
-            if file_path and os.path.exists(full_path):
-                try:
-                    os.remove(full_path)
-                except OSError as e:
-                    print(f"[{Color.YELLOW}WARNING{Color.END}] Error removing file {full_path}: {e}")
-            
-    cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
-    conn.commit()
-    conn.close()
+        for file_path_tuple in expired_files:
+            file_paths = file_path_tuple['file_path'].split(',') if file_path_tuple['file_path'] else []
+            for file_path in file_paths:
+                full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.strip())
+                if file_path and os.path.exists(full_path):
+                    try:
+                        os.remove(full_path)
+                    except OSError as e:
+                        print(f"[{Color.YELLOW}WARNING{Color.END}] Error removing file {full_path}: {e}")
+                
+        cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[{Color.YELLOW}WARNING{Color.END}] Cleanup failed: {e}")
 
 # --- Main CLI Functions ---
 
@@ -726,11 +798,15 @@ def create_new_clip():
 
 def list_clips():
     cleanup_expired_clips()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, key, content, file_path, created_at, expires_at FROM clips ORDER BY id DESC")
-    clips = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, key, content, file_path, created_at, expires_at FROM clips ORDER BY id DESC")
+        clips = cursor.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"{Color.RED}Error accessing database: {e}{Color.END}")
+        return
 
     if not clips:
         print(f"\n{Color.YELLOW}No active clips found.{Color.END}")
@@ -767,48 +843,55 @@ def delete_clip():
 
     clip_id_or_key = input("Enter the ID or Key of the clip to delete: ").strip()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if clip_id_or_key.isdigit():
-        cursor.execute("SELECT id, key, file_path FROM clips WHERE id = ?", (int(clip_id_or_key),))
-    else:
-        cursor.execute("SELECT id, key, file_path FROM clips WHERE key = ?", (clip_id_or_key,))
-    
-    clip = cursor.fetchone()
-    
-    if not clip:
-        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
-        conn.close()
-        return
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if clip_id_or_key.isdigit():
+            cursor.execute("SELECT id, key, file_path FROM clips WHERE id = ?", (int(clip_id_or_key),))
+        else:
+            cursor.execute("SELECT id, key, file_path FROM clips WHERE key = ?", (clip_id_or_key,))
+        
+        clip = cursor.fetchone()
+        
+        if not clip:
+            print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
+            conn.close()
+            return
 
-    clip_id = clip['id']
-    clip_key = clip['key']
-    
-    if clip['file_path']:
-        file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
-        for file_path in file_paths:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                print(f" - File deleted: {os.path.basename(file_path)}")
-                
-    cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
-    conn.commit()
-    conn.close()
-    
-    print(f"\n{Color.GREEN}✅ Clip ID {clip_id} (Key: {clip_key}) successfully deleted.{Color.END}")
+        clip_id = clip['id']
+        clip_key = clip['key']
+        
+        if clip['file_path']:
+            file_paths = [p.strip() for p in clip['file_path'].split(',') if p.strip()]
+            for file_path in file_paths:
+                full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+                if os.path.exists(full_path):
+                    os.remove(full_path)
+                    print(f" - File deleted: {os.path.basename(file_path)}")
+                    
+        cursor.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
+        conn.commit()
+        conn.close()
+        
+        print(f"\n{Color.GREEN}✅ Clip ID {clip_id} (Key: {clip_key}) successfully deleted.{Color.END}")
+    except Exception as e:
+        print(f"{Color.RED}Error during deletion: {e}{Color.END}")
 
 def get_clip_by_id_or_key(identifier):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    if identifier.isdigit():
-        cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE id = ?", (int(identifier),))
-    else:
-        cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE key = ?", (identifier,))
-    clip = cursor.fetchone()
-    conn.close()
-    return clip
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if identifier.isdigit():
+            cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE id = ?", (int(identifier),))
+        else:
+            cursor.execute("SELECT id, key, content, expires_at FROM clips WHERE key = ?", (identifier,))
+        clip = cursor.fetchone()
+        conn.close()
+        return clip
+    except Exception as e:
+        print(f"{Color.RED}Database error: {e}{Color.END}")
+        return None
 
 def edit_clip_expiry():
     list_clips()
@@ -833,8 +916,7 @@ def edit_clip_expiry():
         if new_days_str.startswith('+') or new_days_str.startswith('-'):
             adjustment_days = int(new_days_str)
             
-            # Find the original creation time (This is complex/buggy, simpler is: adjust from current expiry)
-            # Simpler approach: Calculate new expiry date based on adjustment from current expiry
+            # Calculate new expiry date based on adjustment from current expiry
             current_expiry_dt = datetime.fromtimestamp(clip['expires_at'], tz=timezone.utc)
             new_expiry_dt = current_expiry_dt + timedelta(days=adjustment_days)
             
@@ -879,7 +961,7 @@ def edit_clip():
     print(f"\n{Color.CYAN}--- Select Clip Editing Option ---{Color.END}")
     print(f"1. Edit Key")
     print(f"2. Edit Content")
-    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}") # V41: New Option
+    print(f"3. {Color.YELLOW}Edit Expiry Duration{Color.END}")
     print(f"0. Cancel")
     
     choice = input("Enter your choice (1/2/3/0): ").strip()
@@ -891,69 +973,99 @@ def edit_clip():
     # Rest of the old logic for Key/Content editing
     clip_id_or_key = input("\nEnter the ID or Key of the clip to edit (for Key/Content): ").strip()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if clip_id_or_key.isdigit():
-        cursor.execute("SELECT id, key, content FROM clips WHERE id = ?", (int(clip_id_or_key),))
-    else:
-        cursor.execute("SELECT id, key, content FROM clips WHERE key = ?", (clip_id_or_key,))
-    
-    clip = cursor.fetchone()
-    
-    if not clip:
-        print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
-        conn.close()
-        return
-
-    clip_id = clip['id']
-    clip_key = clip['key']
-
-    if choice == '1':
-        new_key = input(f"Enter new key (Current: {clip_key}): ").strip()
-        if not new_key or not re.match(KEY_REGEX, new_key):
-            print(f"{Color.RED}Error: Invalid or empty key.{Color.END}")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if clip_id_or_key.isdigit():
+            cursor.execute("SELECT id, key, content FROM clips WHERE id = ?", (int(clip_id_or_key),))
+        else:
+            cursor.execute("SELECT id, key, content FROM clips WHERE key = ?", (clip_id_or_key,))
+        
+        clip = cursor.fetchone()
+        
+        if not clip:
+            print(f"{Color.RED}Error: Clip with ID/Key '{clip_id_or_key}' not found.{Color.END}")
             conn.close()
             return
-        
-        if new_key != clip_key:
-            cursor.execute("SELECT 1 FROM clips WHERE key = ? AND id != ?", (new_key, clip_id))
-            if cursor.fetchone():
-                print(f"{Color.RED}Error: Key '{new_key}' is already taken.{Color.END}")
+
+        clip_id = clip['id']
+        clip_key = clip['key']
+
+        if choice == '1':
+            new_key = input(f"Enter new key (Current: {clip_key}): ").strip()
+            if not new_key or not re.match(KEY_REGEX, new_key):
+                print(f"{Color.RED}Error: Invalid or empty key.{Color.END}")
                 conn.close()
                 return
-        
-        cursor.execute("UPDATE clips SET key = ? WHERE id = ?", (new_key, clip_id))
-        conn.commit()
-        print(f"\n{Color.GREEN}✅ Key successfully updated to {new_key}.{Color.END}")
-        
-    elif choice == '2':
-        print(f"\n{Color.YELLOW}--- Current Content ---{Color.END}")
-        print(clip['content'] if clip['content'] else "(Empty)")
-        print("---------------------------------------")
-        print(f"Type new content. Press {Color.BOLD}Ctrl+D{Color.END} (or Ctrl+Z on Windows), then Enter, to save and finish.")
-        
-        content_lines = []
-        try:
-            while True:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                content_lines.append(line.rstrip('\n'))
-            new_content = "\n".join(content_lines)
-        except EOFError:
-            new_content = "\n".join(content_lines)
             
-        cursor.execute("UPDATE clips SET content = ? WHERE id = ?", (new_content, clip_id))
-        conn.commit()
-        print(f"\n{Color.GREEN}✅ Content successfully updated.{Color.END}")
-    
-    elif choice == '0':
-        print("Editing cancelled.")
-    else:
-         print(f"{Color.RED}Invalid choice.{Color.END}")
+            if new_key != clip_key:
+                cursor.execute("SELECT 1 FROM clips WHERE key = ? AND id != ?", (new_key, clip_id))
+                if cursor.fetchone():
+                    print(f"{Color.RED}Error: Key '{new_key}' is already taken.{Color.END}")
+                    conn.close()
+                    return
+            
+            cursor.execute("UPDATE clips SET key = ? WHERE id = ?", (new_key, clip_id))
+            conn.commit()
+            print(f"\n{Color.GREEN}✅ Key successfully updated to {new_key}.{Color.END}")
+            
+        elif choice == '2':
+            print(f"\n{Color.YELLOW}--- Current Content ---{Color.END}")
+            print(clip['content'] if clip['content'] else "(Empty)")
+            print("---------------------------------------")
+            print(f"Type new content. Press {Color.BOLD}Ctrl+D{Color.END} (or Ctrl+Z on Windows), then Enter, to save and finish.")
+            
+            content_lines = []
+            try:
+                while True:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    content_lines.append(line.rstrip('\n'))
+                new_content = "\n".join(content_lines)
+            except EOFError:
+                new_content = "\n".join(content_lines)
+                
+            cursor.execute("UPDATE clips SET content = ? WHERE id = ?", (new_content, clip_id))
+            conn.commit()
+            print(f"\n{Color.GREEN}✅ Content successfully updated.{Color.END}")
+        
+        elif choice == '0':
+            print("Editing cancelled.")
+        else:
+             print(f"{Color.RED}Invalid choice.{Color.END}")
 
-    conn.close()
+        conn.close()
+    except Exception as e:
+        print(f"{Color.RED}Error during edit operation: {e}{Color.END}")
+
+def check_service_status():
+    print(f"\n{Color.CYAN}{Color.BOLD}--- Service Status Check ---{Color.END}")
+    try:
+        import subprocess
+        result = subprocess.run(['systemctl', 'is-active', 'clipboard.service'], 
+                               capture_output=True, text=True)
+        status = result.stdout.strip()
+        
+        if status == 'active':
+            print(f"{Color.GREEN}✅ Clipboard service is ACTIVE{Color.END}")
+            
+            # Check if port is listening
+            result = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
+            if f':{CLIPBOARD_PORT} ' in result.stdout:
+                print(f"{Color.GREEN}✅ Port {CLIPBOARD_PORT} is LISTENING{Color.END}")
+            else:
+                print(f"{Color.RED}❌ Port {CLIPBOARD_PORT} is NOT LISTENING{Color.END}")
+                
+            # Show recent logs
+            print(f"\n{Color.YELLOW}Recent logs:{Color.END}")
+            subprocess.run(['journalctl', '-u', 'clipboard.service', '-n', '10', '--no-pager'])
+        else:
+            print(f"{Color.RED}❌ Clipboard service is {status.upper()}{Color.END}")
+            
+    except Exception as e:
+        print(f"{Color.RED}Error checking service status: {e}{Color.END}")
 
 def main_menu():
     global EXPIRY_DAYS, BASE_URL, SERVER_IP
@@ -978,9 +1090,10 @@ def main_menu():
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
         print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
-        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)") # V41: Updated description
+        print(f"3. {Color.CYAN}Edit Clip{Color.END} (Key, Content or Expiry)")
         print(f"4. {Color.RED}Delete Clip{Color.END}")
-        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)") 
+        print(f"5. {Color.YELLOW}Change Default Expiry Days{Color.END} (Current: {EXPIRY_DAYS} Days)")
+        print(f"6. {Color.BLUE}Check Service Status{Color.END}")
         print("0. Exit")
         
         choice = input("Enter your choice: ").strip()
@@ -995,6 +1108,8 @@ def main_menu():
             delete_clip()
         elif choice == '5': 
             change_expiry_days()
+        elif choice == '6':
+            check_service_status()
         elif choice == '0':
             print(f"\n{Color.BOLD}Exiting CLI Management. Goodbye!{Color.END}")
             break
@@ -1007,11 +1122,11 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create Minimal Templates (V41 + Fix Copy)
+# 5. Create Minimal Templates (Enhanced)
 # ============================================
-print_status "5/7: Creating HTML templates (V41 + Fix Copy)..."
+print_status "5/7: Creating HTML templates..."
 
-# --- index.html (Retained) ---
+# --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1025,6 +1140,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
         .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
         .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         form div { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
         textarea, input[type="text"], input[type="file"] { 
@@ -1047,6 +1163,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         }
         input[type="submit"]:hover { background-color: #4cae4c; }
         .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
+        .info-note { margin-top: 20px; padding: 10px; background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 6px; color: #856404; font-size: 0.9em;}
     </style>
 </head>
 <body>
@@ -1055,6 +1172,12 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
         
         <div class="flash error">
             {% for message in get_flashed_messages(category_filter=['error']) %}
+                {{ message }}
+            {% endfor %}
+        </div>
+        
+        <div class="flash success">
+            {% for message in get_flashed_messages(category_filter=['success']) %}
                 {{ message }}
             {% endfor %}
         </div>
@@ -1070,7 +1193,6 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
                 <input type="file" id="files" name="files" multiple>
             </div>
             
-             {# V37: New field for URL uploads #}
             <div>
                 <label for="url_files">File Upload via URL Link (Optional - One link per line):</label>
                 <textarea id="url_files" name="url_files" placeholder="Enter file links...">{{ old_url_files }}</textarea>
@@ -1084,6 +1206,10 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
         </form>
         
+        <div class="info-note">
+            📝 <strong>Note:</strong> All file types are allowed. Large files (up to 5000 seconds download time) are supported.
+        </div>
+        
         <div class="cli-note">
             ⚠️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
             <code>sudo /opt/clipboard_server/clipboard_cli.sh</code>
@@ -1093,7 +1219,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (V41 + FIX: Reliable Copy Logic) ---
+# --- clipboard.html ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1119,6 +1245,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
         .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: left; margin-right: 10px; }
         .copy-button:hover { background-color: #4cae4c; }
+        .clip-info { text-align: center; color: #6c757d; margin-bottom: 20px; font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -1131,9 +1258,12 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             {% endfor %}
         </div>
         
-        {# V35 FIX: Check if clip exists AND (has content OR has files_info). #}
         {% if clip and (content or files_info) %}
             <h1>Clip Content for: {{ key }}</h1>
+            
+            <div class="clip-info">
+                Share this link: <code>http://{{ request.host }}/{{ key }}</code>
+            </div>
             
             <div class="expiry-info">
                 Expires in: {{ expiry_info_days }} days, {{ expiry_info_hours }} hours, and {{ expiry_info_minutes }} minutes.
@@ -1149,7 +1279,6 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 {% endif %}
             </div>
         
-        {# اگر کلیپ پیدا نشد یا منقضی شده بود #}
         {% else %}
              <h1>Clip Not Found</h1>
              <div class="expiry-info">
@@ -1189,53 +1318,45 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
             // 1. Try modern clipboard API (async, preferred)
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(contentElement.innerText).then(() => {
-                    alert('Text copied to clipboard! (Modern API)');
+                    alert('Text copied to clipboard!');
                 }).catch(err => {
-                    // Fallback if permission is denied or API fails
                     console.error('Copy failed (Modern API): ', err);
                     copyFallback(contentElement);
                 });
             } else {
-                // 2. Use deprecated execCommand fallback (synchronous)
                 copyFallback(contentElement);
             }
         }
         
         function copyFallback(element) {
             try {
-                // Create a temporary textarea for selection/copying
                 const tempTextArea = document.createElement('textarea');
                 tempTextArea.value = element.innerText;
                 
-                // Hide the textarea visually
                 tempTextArea.style.position = 'fixed';
                 tempTextArea.style.top = '0';
                 tempTextArea.style.left = '0';
                 tempTextArea.style.opacity = '0';
                 
                 document.body.appendChild(tempTextArea);
-                
-                // Select and copy
                 tempTextArea.select();
-                tempTextArea.setSelectionRange(0, 99999); // For mobile devices
-                
-                // Use deprecated but widely supported copy command
+                tempTextArea.setSelectionRange(0, 99999);
                 document.execCommand('copy');
                 document.body.removeChild(tempTextArea);
                 
-                alert('Text copied to clipboard! (Compatible Method)');
+                alert('Text copied to clipboard!');
             } catch (err) {
                 console.error('Copy failed (Fallback): ', err);
                 alert('Copy Error! Please manually select and copy the text.');
             }
         }
-</script>
+    </script>
 </body>
 </html>
 CLIPBOARDEOF
 
 
-# --- error.html --- (No Change)
+# --- error.html ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1249,16 +1370,34 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
         h1 { color: #dc3545; margin-bottom: 20px; }
         p { font-size: 1.1em; color: #555; }
         .error-message { margin-top: 30px; padding: 15px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; color: #721c24; font-weight: bold; }
+        .troubleshoot { margin-top: 30px; padding: 15px; background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; color: #856404; text-align: left; }
+        code { background-color: #f8f9fa; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>❌ Internal Error</h1>
+        <h1>❌ Error Occurred</h1>
         <div class="error-message">
             <p>{{ message }}</p>
         </div>
-        <p>This is likely a server configuration issue.</p>
-        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
+        
+        <div class="troubleshoot">
+            <p><strong>Troubleshooting steps:</strong></p>
+            <ol>
+                <li>Check if the clipboard service is running:<br>
+                    <code>sudo systemctl status clipboard.service</code></li>
+                <li>View service logs:<br>
+                    <code>sudo journalctl -u clipboard.service -f</code></li>
+                <li>Restart the service:<br>
+                    <code>sudo systemctl restart clipboard.service</code></li>
+                <li>Use CLI tool to check database:<br>
+                    <code>sudo /opt/clipboard_server/clipboard_cli.sh</code></li>
+            </ol>
+        </div>
+        
+        <p style="margin-top: 20px;">
+            <a href="/">← Back to Home</a>
+        </p>
     </div>
 </body>
 </html>
@@ -1266,24 +1405,38 @@ ERROREOF
 
 
 # ============================================
-# 6. Create Systemd Service (Workers set to 2 in V41)
+# 6. Create Enhanced Systemd Service
 # ============================================
-print_status "6/7: Creating Systemd service for web server (Workers: 2 - V41 Optimization)..."
+print_status "6/7: Creating Systemd service for web server (Enhanced)..."
 
-# --- clipboard.service (Port 3214 - Runs web_service.py) ---
+# --- clipboard.service ---
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
 Description=Flask Clipboard Web Server (Full Submission, CLI Management)
 After=network.target
+StartLimitIntervalSec=500
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${GUNICORN_VENV_PATH} --workers 2 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
-Restart=always
-TimeoutSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=${INSTALL_DIR}
+ExecStart=${GUNICORN_VENV_PATH} --workers 2 --threads 4 --bind 0.0.0.0:${CLIPBOARD_PORT} --timeout 120 --access-logfile - --error-logfile - web_service:app
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clipboard
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${INSTALL_DIR}/uploads ${INSTALL_DIR}/clipboard.db
 
 [Install]
 WantedBy=multi-user.target
@@ -1291,9 +1444,9 @@ SERVICEEOF
 
 
 # ============================================
-# 7. Final Steps
+# 7. Final Steps & Health Check
 # ============================================
-print_status "7/7: Initializing database and starting service..."
+print_status "7/7: Initializing database, starting service, and running health check..."
 
 # Create a simple wrapper script for CLI execution
 cat > "$INSTALL_DIR/clipboard_cli.sh" << CLISHEOF
@@ -1303,26 +1456,103 @@ exec ${PYTHON_VENV_PATH} ${INSTALL_DIR}/clipboard_cli.py "\$@"
 CLISHEOF
 chmod +x "$INSTALL_DIR/clipboard_cli.sh"
 
+# Create health check script
+cat > "$INSTALL_DIR/health_check.py" << HEALTHEOF
+#!/usr/bin/env python3
+import requests
+import sys
+import time
+
+def health_check():
+    try:
+        response = requests.get('http://localhost:3214/', timeout=5)
+        if response.status_code == 200:
+            print("✅ Health check PASSED: Service is responding")
+            return True
+        else:
+            print(f"❌ Health check FAILED: Status code {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ Health check FAILED: {e}")
+        return False
+
+if __name__ == '__main__':
+    # Try multiple times
+    for i in range(3):
+        print(f"Health check attempt {i+1}/3...")
+        if health_check():
+            sys.exit(0)
+        if i < 2:
+            time.sleep(2)
+    sys.exit(1)
+HEALTHEOF
+
+chmod +x "$INSTALL_DIR/health_check.py"
+
 # Initialize DB using the new wrapper script
 "$INSTALL_DIR/clipboard_cli.sh" --init-db 
 
+# Fix permissions
+chmod -R 755 "$INSTALL_DIR"
+chmod 777 "$INSTALL_DIR/uploads"
+chmod 666 "$INSTALL_DIR/clipboard.db" 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl enable clipboard.service
-systemctl restart clipboard.service
+
+# Start service with delay
+print_status "Starting clipboard service..."
+systemctl start clipboard.service
+
+# Wait a moment for service to start
+sleep 3
+
+# Run health check
+print_status "Running health check..."
+if "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/health_check.py"; then
+    HEALTH_STATUS="✅"
+else
+    HEALTH_STATUS="⚠️ "
+    print_warning "Health check failed, but service may still be starting..."
+    sleep 5
+fi
+
+# Get current IP
+CURRENT_IP=$(hostname -I | awk '{print $1}')
+if [ -z "$CURRENT_IP" ]; then
+    CURRENT_IP="YOUR_IP"
+fi
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V41 + Copy Fix + Enhanced File Support)"
+echo "🎉 Installation Complete (Clipboard Server V42 - Enhanced Stability)"
 echo "================================================"
-echo "✅ Web service is active on port ${CLIPBOARD_PORT} (with 2 Workers)."
+echo "${HEALTH_STATUS} Web service is configured on port ${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "🌐 Web Address: http://YOUR_IP:${CLIPBOARD_PORT}"
+echo "🌐 Web Address: http://${CURRENT_IP}:${CLIPBOARD_PORT}"
+echo "🌐 Local Access: http://localhost:${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
-echo "💻 CLI Management (for list/delete/change expiry):"
+echo "💻 CLI Management:"
 echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
-echo "⚠️  File restrictions REMOVED - All file types allowed"
-echo "⚠️  Download timeout increased to 5000 seconds"
+echo "📋 Features:"
+echo "   • No file type restrictions"
+echo "   • 5000 seconds download timeout"
+echo "   • Enhanced error handling"
+echo "   • Automatic database repair"
 echo "------------------------------------------------"
-echo "Logs:    sudo journalctl -u clipboard.service -f"
+echo "🔧 Service Commands:"
+echo "   Status:  sudo systemctl status clipboard.service"
+echo "   Restart: sudo systemctl restart clipboard.service"
+echo "   Logs:    sudo journalctl -u clipboard.service -f"
+echo "------------------------------------------------"
+echo "⚠️  If you see 503 error, wait 30 seconds and refresh"
 echo "================================================"
+
+# Final check
+if systemctl is-active --quiet clipboard.service; then
+    print_status "Service is running successfully!"
+else
+    print_warning "Service may need manual start. Running: sudo systemctl start clipboard.service"
+    systemctl start clipboard.service
+fi
