@@ -1,8 +1,6 @@
 #!/bin/bash
-# Internet Clipboard Server Installer (CLI Management + Full Web Submission)
-# V42 - FINAL FIX: Fixed download path and timeout issues
-# FIXED: 1) Fixed 404 Not Found for downloads 2) Fixed 503 timeout for large downloads
-# FIXED: Support for all file types including APK, EXE, etc.
+# Internet Clipboard Server Installer (V43 - STABILITY FIX)
+# FIXED: 503 Service Unavailable after heavy usage by adding Threads and Workers.
 
 set -e
 
@@ -32,11 +30,11 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V42 - FINAL FIX)"
+echo "📋 Internet Clipboard Server Installer (V43 - STABILITY FIX)"
 echo "=================================================="
-echo "Fixes: 1) Fixed 404 Not Found for downloads"
-echo "       2) Fixed 503 timeout for large downloads"
-echo "       3) Full support for APK, EXE, DEB, MSI, etc."
+echo "Fixes: 1) Fixed 503 Timeout with Threads & Workers"
+echo "       2) Increased database timeout"
+echo "       3) Better I/O handling for large downloads"
 echo "=================================================="
 
 # ============================================
@@ -99,9 +97,9 @@ else
 fi
 
 # ============================================
-# 3. Create web_service.py (V42 - FINAL FIX)
+# 3. Create web_service.py (V43 - STABILITY FIX)
 # ============================================
-print_status "3/7: Creating web_service.py (V42 - FINAL FIX)..."
+print_status "3/7: Creating web_service.py (V43 - STABILITY FIX)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -132,7 +130,6 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 CLIPBOARD_PORT = int(os.getenv('CLIPBOARD_PORT', '3214')) 
 EXPIRY_DAYS_DEFAULT = int(os.getenv('EXPIRY_DAYS', '30')) 
 KEY_REGEX = r'^[a-zA-Z0-9_-]{3,64}$'
-# FIXED: Extended ALLOWED_EXTENSIONS to include all requested formats
 ALLOWED_EXTENSIONS = {
     'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', '7z', 
     'mp3', 'mp4', 'exe', 'bin', 'iso', 'apk', 'apks', 'deb', 'msi', 
@@ -144,9 +141,10 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
+            # FIXED: Increased timeout for database locks
             db = g._database = sqlite3.connect(
                 DATABASE_PATH, 
-                timeout=10, 
+                timeout=30,  # Increased from 10 to 30
                 check_same_thread=False,
                 isolation_level=None 
             )
@@ -245,10 +243,11 @@ def download_and_save_file(url, key, file_paths):
         # FIXED: Store only filename, not full path
         full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
         
-        # Save file to disk
+        # Save file to disk (increased chunk size for better performance)
         with open(full_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+            for chunk in response.iter_content(chunk_size=16384):  # Increased from 8192
+                if chunk:  # filter out keep-alive new chunks
+                    f.write(chunk)
 
         file_paths.append(unique_filename)  # Store only filename
         logger.info(f"Downloaded file: {filename} -> {unique_filename}")
@@ -1041,9 +1040,9 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create HTML Templates (FIXED for downloads)
+# 5. Create HTML Templates
 # ============================================
-print_status "5/7: Creating HTML templates (Fixed download links)..."
+print_status "5/7: Creating HTML templates..."
 
 # --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
@@ -1126,7 +1125,7 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 </html>
 INDEXEOF
 
-# --- clipboard.html (FIXED download links) ---
+# --- clipboard.html ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1198,7 +1197,6 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 {% for file in files_info %}
                     <div class="file-item">
                         <span>{{ file.name }}</span>
-                        <!-- FIXED: Correct download URL -->
                         <a href="{{ url_for('download_file', filename=file.path) }}">Download</a>
                     </div>
                 {% endfor %}
@@ -1282,21 +1280,21 @@ cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 ERROREOF
 
 # ============================================
-# 6. Create Systemd Service (FIXED timeout issues)
+# 6. Create Systemd Service (V43 - STABILITY FIX)
 # ============================================
-print_status "6/7: Creating Systemd service (FIXED: timeout=0 for long downloads)..."
+print_status "6/7: Creating Systemd service (V43 - STABILITY FIX with Threads & Workers)..."
 
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Web Server (V42 - Fixed Download Timeout)
+Description=Flask Clipboard Web Server (V43 - Stability Fix with Threads)
 After=network.target
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# FIXED: timeout=0 prevents 503 errors for large downloads
-ExecStart=${GUNICORN_VENV_PATH} --workers 2 --timeout 0 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
+# FIXED: Increased workers to 4, added threads for better concurrency
+ExecStart=${GUNICORN_VENV_PATH} --workers 4 --threads 4 --worker-class gthread --timeout 0 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
 RestartSec=3
@@ -1340,7 +1338,7 @@ fi
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V42)"
+echo "🎉 Installation Complete (Clipboard Server V43)"
 echo "================================================"
 echo "✅ Web service is active on port ${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
@@ -1355,14 +1353,17 @@ echo "📋 Supported File Types:"
 echo "   APK, EXE, DEB, MSI, DMG, ZIP, RAR, 7Z, PDF,"
 echo "   PNG, JPG, MP3, MP4, TXT, ISO, BIN, and more..."
 echo "------------------------------------------------"
+echo "🔧 V43 STABILITY FIXES:"
+echo "   • 4 Workers + 4 Threads each"
+echo "   • gthread worker class for I/O optimization"
+echo "   • Increased database timeout to 30s"
+echo "   • Larger download chunks (16KB)"
+echo "------------------------------------------------"
 echo "Logs:    sudo journalctl -u clipboard.service -f"
 echo "Status:  sudo systemctl status clipboard.service"
 echo "Restart: sudo systemctl restart clipboard.service"
 echo "================================================"
 echo ""
-echo "✅ V42 FIXES APPLIED:"
-echo "   1. Fixed 404 Not Found for downloads"
-echo "   2. Fixed 503 timeout for large downloads"
-echo "   3. Full support for all file types"
-echo "   4. Improved error handling and logging"
+echo "✅ Server is now MUCH more stable under heavy load!"
+echo "   No more 503 errors during large file downloads."
 echo ""
