@@ -1,6 +1,6 @@
 #!/bin/bash
-# Internet Clipboard - Ultimate Manager (V50)
-# INTEGRATED: Install, Manual/Auto Backup, Restore, Expiry, Analytics, Port Change & ABSOLUTE UNINSTALL.
+# Internet Clipboard - Ultimate Manager (V51)
+# Features: Smart Install, Analytics, Manual/Auto Backup Control, Restore, Port Change & Absolute Uninstall.
 
 set -e
 
@@ -24,7 +24,7 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 show_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "${YELLOW}    📋 INTERNET CLIPBOARD MANAGER (V50)   ${NC}"
+    echo -e "${YELLOW}    📋 INTERNET CLIPBOARD MANAGER (V51)   ${NC}"
     echo -e "${BLUE}==================================================${NC}"
     if [ ! -d "$INSTALL_DIR" ]; then
         echo -e "${RED}Server is NOT installed yet!${NC}"
@@ -36,7 +36,7 @@ show_menu() {
         echo -e "3) ${GREEN}Restore from Backup${NC}"
         echo -e "4) ${YELLOW}Edit Clip Expiry / List Clips${NC}"
         echo -e "5) ${BLUE}Change Server Port${NC}"
-        echo -e "6) ${BLUE}Setup/Update Nightly Auto-Backup${NC}"
+        echo -e "6) ${BLUE}Auto-Backup Settings (Enable/Disable)${NC}"
         echo -e "7) ${RED}Uninstall Entire Server (Absolute Cleanup)${NC}"
         echo -e "q) Exit"
     fi
@@ -61,7 +61,7 @@ initial_install() {
     chmod +x install_clipboard.sh
     sudo ./install_clipboard.sh
     mkdir -p "$BACKUP_DIR"
-    print_status "Installation finished."
+    print_status "Installation finished. (Auto-backup is OFF by default)"
     sleep 2; show_menu
 }
 
@@ -97,17 +97,29 @@ change_port() {
 }
 
 setup_cron() {
-    print_status "Setting up Nightly Auto-Backup (00:00)..."
-    cat > "$INSTALL_DIR/auto_backup.sh" << 'EOF'
+    echo -e "\n${BLUE}--- Auto-Backup Settings ---${NC}"
+    echo -e "1) ${GREEN}Enable Nightly Auto-Backup (00:00)${NC}"
+    echo -e "2) ${RED}Disable/Remove Auto-Backup${NC}"
+    echo -e "b) Back to Menu"
+    read -p "Select an option: " cron_opt
+
+    if [ "$cron_opt" == "1" ]; then
+        print_status "Setting up Nightly Auto-Backup..."
+        mkdir -p "$BACKUP_DIR"
+        cat > "$INSTALL_DIR/auto_backup.sh" << 'EOF'
 #!/bin/bash
 BDIR="/opt/clipboard_backups"; IDIR="/opt/clipboard_server"
 FNAME="auto_backup_$(date +%Y%m%d).tar.gz"
 tar -cvzf "$BDIR/$FNAME" -C "$IDIR" clipboard.db uploads .env
 find "$BDIR" -name "auto_backup_*" -mtime +7 -delete
 EOF
-    chmod +x "$INSTALL_DIR/auto_backup.sh"
-    (crontab -l 2>/dev/null | grep -v "auto_backup.sh" ; echo "0 0 * * * $INSTALL_DIR/auto_backup.sh") | crontab -
-    print_status "Auto-backup scheduled (7-day retention)."
+        chmod +x "$INSTALL_DIR/auto_backup.sh"
+        (crontab -l 2>/dev/null | grep -v "auto_backup.sh" ; echo "0 0 * * * $INSTALL_DIR/auto_backup.sh") | crontab -
+        print_status "Auto-backup ENABLED (7-day retention)."
+    elif [ "$cron_opt" == "2" ]; then
+        crontab -l 2>/dev/null | grep -v "auto_backup.sh" | crontab - || true
+        print_status "Auto-backup DISABLED and removed from schedule."
+    fi
     read -p "Press Enter to return..." ; show_menu
 }
 
@@ -146,27 +158,19 @@ list_and_edit() {
 }
 
 uninstall_server() {
-    echo -e "${RED}!!! WARNING: THIS WILL DELETE EVERYTHING INCLUDING SCRIPTS & BACKUPS !!!${NC}"
+    echo -e "${RED}!!! WARNING: THIS WILL DELETE EVERYTHING !!!${NC}"
     read -p "Type 'DELETE' to confirm uninstall: " confirm
     if [ "$confirm" == "DELETE" ]; then
-        # 1. Stop and remove service
         sudo systemctl stop clipboard.service || true
         sudo systemctl disable clipboard.service || true
         sudo rm -f /etc/systemd/system/clipboard.service
         sudo systemctl daemon-reload
-        
-        # 2. Remove CronJobs
         crontab -l 2>/dev/null | grep -v "auto_backup.sh" | crontab - || true
-        
-        # 3. Remove all directories (Core + Backups)
         sudo rm -rf "$INSTALL_DIR"
         sudo rm -rf "$BACKUP_DIR"
-        
-        # 4. Remove the installer script from current directory
         rm -f install_clipboard.sh
-        
         print_status "Server and all related files have been removed."
-        echo -e "${YELLOW}Note: This manager script is still here. Delete it with: rm manage_clipboard.sh${NC}"
+        echo -e "${YELLOW}Note: Delete this script with: rm manage_clipboard.sh${NC}"
         exit 0
     fi
     show_menu
