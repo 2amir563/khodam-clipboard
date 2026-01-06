@@ -1,10 +1,39 @@
 
 
+
+نصب کامل کلیب بورد با مدیریت سرور با کد زیر بطور پیشفرض روی پورت 3214 نصب میشود
+
+```
+
+```
+
+
+
+و برای مدیریت روی سرور کد زیر
+
+```
+./manage_clipboard.sh
+```
+
+
+............................................................................................................................
+
 روی پورت 3214 نصب میشود
 
 
 ```
 curl -o install_clipboard.sh https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/install_clipboard.sh && chmod +x install_clipboard.sh && sudo ./install_clipboard.sh
+```
+برای مدیریت سرور میتوان یکی از دو کد دستوری زیر را در سرور زد
+
+```
+./manage_clipboard.sh
+```
+
+
+
+```
+curl -o manage_clipboard.sh https://raw.githubusercontent.com/2amir563/khodam-clipboard/main/manage_clipboard.sh && chmod +x manage_clipboard.sh && sudo ./manage_clipboard.sh
 ```
 
 
