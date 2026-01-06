@@ -1,6 +1,6 @@
 #!/bin/bash
-# Internet Clipboard Server Installer (V44 - PROGRESS BAR EDITION)
-# FIXED: Added Live Progress Bar for URL Downloads to prevent incomplete files.
+# Internet Clipboard Server Installer (V43 - STABILITY FIX)
+# FIXED: 503 Service Unavailable after heavy usage by adding Threads and Workers.
 
 set -e
 
@@ -30,12 +30,11 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=================================================="
-echo "📋 Internet Clipboard Server Installer (V44 - PROGRESS BAR EDITION)"
+echo "📋 Internet Clipboard Server Installer (V43 - STABILITY FIX)"
 echo "=================================================="
-echo "New Features: 1) Live Progress Bar for URL Downloads"
-echo "              2) Real-time download status monitoring"
-echo "              3) Prevent 404 errors with completion check"
-echo "              4) Enhanced user experience"
+echo "Fixes: 1) Fixed 503 Timeout with Threads & Workers"
+echo "       2) Increased database timeout"
+echo "       3) Better I/O handling for large downloads"
 echo "=================================================="
 
 # ============================================
@@ -60,7 +59,7 @@ source venv/bin/activate || true
 PYTHON_VENV_PATH="$INSTALL_DIR/venv/bin/python3"
 GUNICORN_VENV_PATH="$INSTALL_DIR/venv/bin/gunicorn"
 
-# Ensure dependencies are installed
+# Ensure dependencies are installed (requests added for URL download)
 cat > requirements.txt << 'REQEOF'
 Flask
 python-dotenv
@@ -98,10 +97,9 @@ else
 fi
 
 # ============================================
-# 3. Create web_service.py (V44 - PROGRESS BAR EDITION)
+# 3. Create web_service.py (V43 - STABILITY FIX)
 # ============================================
-print_status "3/7: Creating web_service.py (V44 - With Progress Bar API)..."
-
+print_status "3/7: Creating web_service.py (V43 - STABILITY FIX)..."
 cat > "$INSTALL_DIR/web_service.py" << 'PYEOF_WEB_SERVICE'
 import os
 import sqlite3
@@ -109,9 +107,8 @@ import re
 import string
 import random
 import time
-import threading
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, g
 from dotenv import load_dotenv, find_dotenv
 from werkzeug.utils import secure_filename
 import requests 
@@ -139,17 +136,15 @@ ALLOWED_EXTENSIONS = {
     'dmg', 'tar', 'gz', 'xz', 'bz2'
 }
 
-# --- Global Progress Tracking ---
-download_progress = {}  # Stores download progress: {task_id: {"progress": 0-100, "status": "..."}}
-
 # --- Utility Functions ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
+            # FIXED: Increased timeout for database locks
             db = g._database = sqlite3.connect(
                 DATABASE_PATH, 
-                timeout=30,
+                timeout=30,  # Increased from 10 to 30
                 check_same_thread=False,
                 isolation_level=None 
             )
@@ -188,6 +183,7 @@ def cleanup_expired_clips():
     cursor = db.cursor()
     now_ts = int(time.time()) 
 
+    # Delete associated files
     cursor.execute("SELECT file_path FROM clips WHERE expires_at < ?", (now_ts,))
     expired_files = cursor.fetchall()
 
@@ -202,49 +198,26 @@ def cleanup_expired_clips():
                 except OSError as e:
                     logger.warning(f"Error removing file {full_path}: {e}")
             
+    # Delete database entries
     cursor.execute("DELETE FROM clips WHERE expires_at < ?", (now_ts,))
     db.commit() 
     logger.info("Cleaned up expired clips")
 
-# --- Progress API Endpoint ---
-@app.route('/progress/<task_id>')
-def get_progress(task_id):
-    """API endpoint to get download progress"""
-    progress_data = download_progress.get(task_id, {"progress": 0, "status": "waiting", "message": ""})
-    return jsonify(progress_data)
-
-# --- Download Worker Function (runs in thread) ---
-def download_worker(url, key, task_id, file_paths, index, total):
+def download_and_save_file(url, key, file_paths):
     """
-    Downloads a file in a separate thread with progress tracking
+    Downloads a file from a URL, saves it, and updates file_paths list.
+    Returns: (bool success, str message)
     """
     try:
-        # Initialize progress
-        download_progress[task_id] = {
-            "progress": 0, 
-            "status": f"downloading_{index}", 
-            "message": f"Starting download {index}/{total}: {os.path.basename(url[:50])}..."
-        }
-        
-        # Validate URL
+        # Basic URL validation
         if not url.lower().startswith(('http://', 'https://')):
-            download_progress[task_id] = {
-                "progress": 0,
-                "status": "error",
-                "message": f"Invalid URL format: {url[:50]}..."
-            }
-            return False
+            return False, "URL must start with http:// or https://."
             
-        # Start download with streaming
+        # FIXED: timeout=None for long downloads
         response = requests.get(url, allow_redirects=True, stream=True, timeout=None)
         
         if response.status_code != 200:
-            download_progress[task_id] = {
-                "progress": 0,
-                "status": "error",
-                "message": f"HTTP Error {response.status_code} for {url[:50]}..."
-            }
-            return False
+            return False, f"HTTP Error {response.status_code} when accessing URL."
 
         # Determine filename
         content_disposition = response.headers.get('Content-Disposition')
@@ -260,81 +233,32 @@ def download_worker(url, key, task_id, file_paths, index, total):
         if not filename or filename == '.':
             filename = "downloaded_file" 
         
-        # Check file extension
+        # Simple extension check
         if not allowed_file(filename):
-            download_progress[task_id] = {
-                "progress": 0,
-                "status": "error",
-                "message": f"File type not allowed: {filename}"
-            }
-            return False
+            return False, f"File type not allowed: {filename}"
         
         filename = secure_filename(filename)
         unique_filename = f"{key}_{filename}"
+        
+        # FIXED: Store only filename, not full path
         full_path = os.path.join(UPLOAD_FOLDER, unique_filename)
         
-        # Get total size if available
-        total_size = response.headers.get('content-length')
-        if total_size:
-            total_size = int(total_size)
-        else:
-            total_size = None
-        
-        # Download with progress tracking
-        downloaded = 0
+        # Save file to disk (increased chunk size for better performance)
         with open(full_path, 'wb') as f:
-            if total_size:
-                # Track progress for known size
-                for chunk in response.iter_content(chunk_size=16384):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        progress = int((downloaded / total_size) * 100)
-                        download_progress[task_id] = {
-                            "progress": progress,
-                            "status": f"downloading_{index}",
-                            "message": f"Downloading {filename}: {progress}% ({downloaded//1024}KB/{total_size//1024}KB)"
-                        }
-            else:
-                # Unknown size - just download
-                f.write(response.content)
-                download_progress[task_id] = {
-                    "progress": 100,
-                    "status": f"downloading_{index}",
-                    "message": f"Downloaded {filename} (size unknown)"
-                }
-        
-        file_paths.append(unique_filename)
-        download_progress[task_id] = {
-            "progress": 100,
-            "status": "completed",
-            "message": f"Successfully downloaded: {filename}"
-        }
-        
+            for chunk in response.iter_content(chunk_size=16384):  # Increased from 8192
+                if chunk:  # filter out keep-alive new chunks
+                    f.write(chunk)
+
+        file_paths.append(unique_filename)  # Store only filename
         logger.info(f"Downloaded file: {filename} -> {unique_filename}")
-        return True
-        
+        return True, filename
+
     except requests.exceptions.Timeout:
-        download_progress[task_id] = {
-            "progress": 0,
-            "status": "error",
-            "message": f"Download timed out: {url[:50]}..."
-        }
-        return False
+        return False, "Download failed: Connection timed out."
     except requests.exceptions.RequestException as e:
-        download_progress[task_id] = {
-            "progress": 0,
-            "status": "error",
-            "message": f"Download failed: {str(e)[:100]}"
-        }
-        return False
+        return False, f"Download failed: {e}"
     except Exception as e:
-        download_progress[task_id] = {
-            "progress": 0,
-            "status": "error",
-            "message": f"Unexpected error: {str(e)[:100]}"
-        }
-        return False
+        return False, f"Unexpected error: {e}"
 
 # --- Database Initialization ---
 def init_db():
@@ -365,15 +289,13 @@ def index():
         'EXPIRY_DAYS': current_expiry_days,
         'old_content': '',
         'old_custom_key': '',
-        'old_url_files': '',
-        'task_id': ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+        'old_url_files': '' 
     }
 
     if request.method == 'POST':
         content = request.form.get('content', '') 
         custom_key = request.form.get('custom_key', '').strip()
-        url_files_input = request.form.get('url_files', '')
-        task_id = request.form.get('task_id', '')
+        url_files_input = request.form.get('url_files', '') 
         
         uploaded_files = request.files.getlist('files')
         url_list = [u.strip() for u in url_files_input.split('\n') if u.strip()] 
@@ -410,8 +332,7 @@ def index():
         # File Handling
         file_paths = []
         has_upload_error = False
-        threads = []
-        
+
         # 1. Local File Upload
         for file in uploaded_files:
             if file and file.filename:
@@ -431,50 +352,21 @@ def index():
                     has_upload_error = True
                     break
         
-        # 2. Remote URL Download with Progress Tracking
+        # 2. Remote URL Download 
         if not has_upload_error and url_list:
-            # Initialize progress tracking for this task
-            download_progress[task_id] = {
-                "progress": 0,
-                "status": "starting",
-                "message": f"Preparing to download {len(url_list)} file(s)..."
-            }
-            
-            # Start download threads
-            for i, url in enumerate(url_list):
-                thread = threading.Thread(
-                    target=download_worker,
-                    args=(url, key, f"{task_id}_{i}", file_paths, i+1, len(url_list))
-                )
-                threads.append(thread)
-                thread.start()
-            
-            # Wait for all downloads to complete
-            for thread in threads:
-                thread.join()
-            
-            # Check if any downloads failed
-            for i in range(len(url_list)):
-                progress_key = f"{task_id}_{i}"
-                if progress_key in download_progress:
-                    if download_progress[progress_key]["status"] == "error":
-                        has_upload_error = True
-                        error_msg = download_progress[progress_key]["message"]
-                        flash(f'Download failed: {error_msg}', 'error')
-                        break
+            for url in url_list:
+                success, msg = download_and_save_file(url, key, file_paths)
+                if not success:
+                    flash(f'Download failed for {url}: {msg}', 'error')
+                    has_upload_error = True
+                    break
             
         if has_upload_error:
-            # Clean up any partially downloaded files
             for fp in file_paths:
                 try: 
                     os.remove(os.path.join(UPLOAD_FOLDER, fp))
                 except: 
                     pass
-            # Clean up progress data
-            for i in range(len(url_list)):
-                progress_key = f"{task_id}_{i}"
-                if progress_key in download_progress:
-                    del download_progress[progress_key]
             return render_template('index.html', **context) 
             
         # Database Insertion
@@ -489,12 +381,6 @@ def index():
             )
             db.commit() 
             logger.info(f"Created new clip: {key}")
-            
-            # Clean up progress data after successful creation
-            for i in range(len(url_list)):
-                progress_key = f"{task_id}_{i}"
-                if progress_key in download_progress:
-                    del download_progress[progress_key]
             
             return redirect(url_for('view_clip', key=key))
             
@@ -572,6 +458,7 @@ def view_clip(key):
                            server_port=CLIPBOARD_PORT,
                            clip=clip)
 
+# FIXED: Correct download route
 @app.route('/download/<filename>')
 def download_file(filename):
     """
@@ -640,9 +527,9 @@ if __name__ == '__main__':
 PYEOF_WEB_SERVICE
 
 # ============================================
-# 4. Create clipboard_cli.py (CLI Tool - Updated for V44)
+# 4. Create clipboard_cli.py (CLI Tool - Unchanged)
 # ============================================
-print_status "4/7: Creating clipboard_cli.py (Updated for V44)..."
+print_status "4/7: Creating clipboard_cli.py..."
 cat > "$INSTALL_DIR/clipboard_cli.py" << 'PYEOF_CLI_TOOL'
 import os
 import sqlite3
@@ -651,6 +538,7 @@ import string
 import re
 import sys
 import time
+import argparse
 import socket 
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -1120,7 +1008,7 @@ def main_menu():
 
     while True:
         print(f"\n{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
-        print(f"{Color.PURPLE}{Color.BOLD}   Clipboard CLI Management V44 (Base URL: {BASE_URL}){Color.END}")
+        print(f"{Color.PURPLE}{Color.BOLD}   Clipboard CLI Management (Base URL: {BASE_URL}){Color.END}")
         print(f"{Color.PURPLE}{Color.BOLD}========================================{Color.END}")
         print(f"1. {Color.GREEN}Create New Clip{Color.END} (Text Only)")
         print(f"2. {Color.BLUE}List All Clips{Color.END}")
@@ -1152,249 +1040,51 @@ if __name__ == '__main__':
 PYEOF_CLI_TOOL
 
 # ============================================
-# 5. Create HTML Templates (V44 - With Progress Bar)
+# 5. Create HTML Templates
 # ============================================
-print_status "5/7: Creating HTML templates with Progress Bar..."
+print_status "5/7: Creating HTML templates..."
 
-# --- index.html (V44 - With Progress Bar) ---
+# --- index.html ---
 cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Internet Clipboard Server V44 - Create</title>
+    <title>Internet Clipboard Server - Create</title>
     <style>
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            color: #333; 
-            margin: 0; 
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container { 
-            max-width: 800px; 
-            margin: 20px auto; 
-            background-color: #fff; 
-            padding: 40px; 
-            border-radius: 16px; 
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
-            transition: all 0.3s ease;
-        }
-        h1 { 
-            color: #2c3e50; 
-            text-align: center; 
-            margin-bottom: 30px; 
-            font-size: 2.2em;
-            background: linear-gradient(90deg, #3498db, #2ecc71);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .flash { 
-            padding: 15px; 
-            border-radius: 10px; 
-            margin-bottom: 20px; 
-            font-weight: 600;
-            border-left: 5px solid;
-            animation: slideIn 0.5s ease;
-        }
-        @keyframes slideIn {
-            from { transform: translateX(-20px); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        .error { 
-            background-color: #ffebee; 
-            color: #c62828; 
-            border-left-color: #c62828;
-        }
-        .success { 
-            background-color: #e8f5e9; 
-            color: #2e7d32; 
-            border-left-color: #2e7d32;
-        }
-        form div { 
-            margin-bottom: 25px; 
-            position: relative;
-        }
-        label { 
-            display: block; 
-            margin-bottom: 8px; 
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 1.05em;
-        }
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 700px; margin: 20px auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #007bff; text-align: center; margin-bottom: 25px; }
+        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        form div { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
         textarea, input[type="text"], input[type="file"] { 
             width: 100%; 
-            padding: 14px; 
+            padding: 10px; 
             box-sizing: border-box; 
-            border: 2px solid #ddd; 
-            border-radius: 10px;
-            font-size: 1em;
-            font-family: inherit;
-            transition: all 0.3s ease;
+            border: 1px solid #ccc; 
+            border-radius: 6px;
         }
-        textarea:focus, input[type="text"]:focus, input[type="file"]:focus {
-            outline: none;
-            border-color: #3498db;
-            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.2);
-        }
-        textarea { 
-            height: 150px; 
-            resize: vertical; 
-            line-height: 1.5;
-        }
+        textarea { height: 120px; resize: vertical; }
         input[type="submit"] {
-            background: linear-gradient(90deg, #3498db, #2ecc71);
+            background-color: #5cb85c;
             color: white;
-            padding: 16px 30px;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 1.2em;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: block;
-            width: 100%;
-            position: relative;
-            overflow: hidden;
-        }
-        input[type="submit"]:hover:not(:disabled) { 
-            transform: translateY(-2px);
-            box-shadow: 0 7px 14px rgba(50, 50, 93, 0.1), 0 3px 6px rgba(0, 0, 0, 0.08);
-        }
-        input[type="submit"]:active:not(:disabled) { 
-            transform: translateY(1px);
-        }
-        input[type="submit"]:disabled {
-            opacity: 0.7;
-            cursor: not-allowed;
-        }
-        .progress-container {
-            display: none;
-            margin-top: 30px;
-            background: #f8f9fa;
-            border-radius: 12px;
-            padding: 25px;
-            border: 2px solid #e9ecef;
-            animation: fadeIn 0.5s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(-10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .progress-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        .progress-title {
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 1.1em;
-        }
-        .progress-percentage {
-            font-weight: 700;
-            color: #3498db;
-            font-size: 1.2em;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 24px;
-            background: #e9ecef;
-            border-radius: 12px;
-            overflow: hidden;
-            position: relative;
-        }
-        .progress-fill {
-            width: 0%;
-            height: 100%;
-            background: linear-gradient(90deg, #2ecc71, #3498db);
-            border-radius: 12px;
-            transition: width 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
-            position: relative;
-            overflow: hidden;
-        }
-        .progress-fill::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(90deg, 
-                rgba(255,255,255,0) 0%, 
-                rgba(255,255,255,0.3) 50%, 
-                rgba(255,255,255,0) 100%);
-            animation: shimmer 2s infinite;
-        }
-        @keyframes shimmer {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-        .progress-status {
-            margin-top: 10px;
-            font-size: 0.95em;
-            color: #666;
-            text-align: center;
-            min-height: 20px;
-        }
-        .progress-details {
-            margin-top: 15px;
-            font-size: 0.9em;
-            color: #7f8c8d;
-            background: #f8f9fa;
-            padding: 12px;
-            border-radius: 8px;
-            border-left: 3px solid #3498db;
-        }
-        .cli-note { 
-            margin-top: 40px; 
-            padding: 20px; 
-            background: linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 100%);
-            border: 2px solid #bbdefb; 
-            border-radius: 12px; 
-            color: #1565c0; 
-            font-weight: 600; 
-            font-size: 0.95em;
-            text-align: center;
-        }
-        .features {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            margin-top: 25px;
-            justify-content: center;
-        }
-        .feature-item {
-            background: #f8f9fa;
             padding: 12px 20px;
-            border-radius: 25px;
-            font-size: 0.9em;
-            color: #2c3e50;
-            border: 1px solid #dee2e6;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            transition: background-color 0.3s;
         }
-        .feature-item::before {
-            content: '✓';
-            color: #2ecc71;
-            font-weight: bold;
-        }
-        .task-id {
-            font-size: 0.85em;
-            color: #7f8c8d;
-            text-align: center;
-            margin-top: 10px;
-            font-family: monospace;
-        }
+        input[type="submit"]:hover { background-color: #4cae4c; }
+        .cli-note { margin-top: 30px; padding: 15px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 8px; color: #0056b3; font-weight: bold; font-size: 0.9em;}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📋 Internet Clipboard Server V44</h1>
+        <h1>📋 Internet Clipboard Server (Create Clip)</h1>
         
         <div class="flash error">
             {% for message in get_flashed_messages(category_filter=['error']) %}
@@ -1402,224 +1092,40 @@ cat > "$INSTALL_DIR/templates/index.html" << 'INDEXEOF'
             {% endfor %}
         </div>
         
-        <div class="flash success">
-            {% for message in get_flashed_messages(category_filter=['success']) %}
-                {{ message }}
-            {% endfor %}
-        </div>
-        
-        <form id="uploadForm" method="POST" enctype="multipart/form-data">
-            <input type="hidden" id="task_id" name="task_id" value="{{ task_id }}">
-            
+        <form method="POST" enctype="multipart/form-data">
             <div>
-                <label for="content">📝 Text Content (Optional):</label>
+                <label for="content">Text Content (Optional):</label>
                 <textarea id="content" name="content" placeholder="Paste your text here...">{{ old_content }}</textarea>
             </div>
             
             <div>
-                <label for="files">📁 Local File Upload (Optional):</label>
+                <label for="files">Local File Upload (Optional):</label>
                 <input type="file" id="files" name="files" multiple>
             </div>
             
             <div>
-                <label for="url_files">🔗 File Upload via URL Link (Optional - One link per line):</label>
-                <textarea id="url_files" name="url_files" placeholder="Paste file URLs here (one per line)...
-
-Examples:
-https://example.com/file.zip
-https://download.com/document.pdf">{{ old_url_files }}</textarea>
+                <label for="url_files">File Upload via URL Link (Optional - One link per line):</label>
+                <textarea id="url_files" name="url_files" placeholder="Enter file links...">{{ old_url_files }}</textarea>
             </div>
 
             <div>
-                <label for="custom_key">🔑 Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
+                <label for="custom_key">Custom Link Key (Optional, e.g., 'my-secret-key'):</label>
                 <input type="text" id="custom_key" name="custom_key" placeholder="Leave blank for a random key" value="{{ old_custom_key }}">
             </div>
             
-            <input type="submit" id="submitBtn" value="🚀 Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
+            <input type="submit" value="Create Clip (Expires in {{ EXPIRY_DAYS }} days)">
         </form>
         
-        <div class="progress-container" id="progressContainer">
-            <div class="progress-header">
-                <div class="progress-title">📥 Download Progress</div>
-                <div class="progress-percentage" id="progressPercentage">0%</div>
-            </div>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill"></div>
-            </div>
-            <div class="progress-status" id="progressStatus">Waiting for download to start...</div>
-            <div class="progress-details" id="progressDetails"></div>
-        </div>
-        
-        <div class="task-id">
-            Task ID: <strong>{{ task_id }}</strong>
-        </div>
-        
-        <div class="features">
-            <div class="feature-item">Live Progress Bar</div>
-            <div class="feature-item">Multiple Files Support</div>
-            <div class="feature-item">URL Downloads</div>
-            <div class="feature-item">Custom Keys</div>
-            <div class="feature-item">30-Day Expiry</div>
-        </div>
-        
         <div class="cli-note">
-            ⚙️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
+            ⚠️ Management panel is only accessible via the Command Line Interface (CLI) on the server: 
             <code>sudo /opt/clipboard_server/clipboard_cli.sh</code>
         </div>
     </div>
-    
-    <script>
-        const form = document.getElementById('uploadForm');
-        const submitBtn = document.getElementById('submitBtn');
-        const progressContainer = document.getElementById('progressContainer');
-        const progressFill = document.getElementById('progressFill');
-        const progressPercentage = document.getElementById('progressPercentage');
-        const progressStatus = document.getElementById('progressStatus');
-        const progressDetails = document.getElementById('progressDetails');
-        const urlTextarea = document.getElementById('url_files');
-        const taskId = document.getElementById('task_id').value;
-        
-        let progressInterval = null;
-        let isDownloading = false;
-        
-        // Update task ID in form for each new page load
-        document.getElementById('task_id').value = taskId;
-        
-        form.addEventListener('submit', async function(e) {
-            const urlContent = urlTextarea.value.trim();
-            
-            // Only show progress bar if there are URLs to download
-            if (urlContent) {
-                e.preventDefault();
-                
-                // Disable submit button
-                submitBtn.disabled = true;
-                submitBtn.value = "⏳ Processing...";
-                
-                // Show progress container with animation
-                progressContainer.style.display = 'block';
-                progressContainer.style.animation = 'fadeIn 0.5s ease';
-                
-                // Start progress monitoring
-                startProgressMonitoring();
-                
-                // Submit form after a short delay to show progress UI
-                setTimeout(() => {
-                    form.submit();
-                }, 100);
-            }
-            // If no URLs, just submit normally
-        });
-        
-        function startProgressMonitoring() {
-            if (progressInterval) {
-                clearInterval(progressInterval);
-            }
-            
-            let totalUrls = 0;
-            const urlContent = urlTextarea.value.trim();
-            if (urlContent) {
-                totalUrls = urlContent.split('\n').filter(line => line.trim()).length;
-            }
-            
-            progressInterval = setInterval(async () => {
-                try {
-                    // Check progress for each URL
-                    let totalProgress = 0;
-                    let totalCompleted = 0;
-                    let allDone = true;
-                    let anyError = false;
-                    let errorMessage = '';
-                    
-                    for (let i = 0; i < totalUrls; i++) {
-                        const progressKey = `${taskId}_${i}`;
-                        const response = await fetch(`/progress/${progressKey}`);
-                        if (response.ok) {
-                            const data = await response.json();
-                            
-                            totalProgress += data.progress || 0;
-                            
-                            if (data.status === 'completed' || data.status === 'done') {
-                                totalCompleted++;
-                            } else if (data.status === 'error') {
-                                anyError = true;
-                                errorMessage = data.message || 'Unknown error';
-                            }
-                            
-                            if (data.status !== 'completed' && data.status !== 'done' && data.status !== 'error') {
-                                allDone = false;
-                            }
-                            
-                            // Update status message for the first active download
-                            if (i === 0 && data.message) {
-                                progressStatus.textContent = data.message;
-                                progressDetails.textContent = `Downloading file ${i+1}/${totalUrls}`;
-                            }
-                        }
-                    }
-                    
-                    // Calculate average progress
-                    const avgProgress = totalUrls > 0 ? Math.floor(totalProgress / totalUrls) : 0;
-                    
-                    // Update UI
-                    progressFill.style.width = avgProgress + '%';
-                    progressPercentage.textContent = avgProgress + '%';
-                    
-                    if (totalUrls === 0) {
-                        progressStatus.textContent = 'No URLs to download';
-                        progressDetails.textContent = 'Uploading local files only...';
-                    } else if (anyError) {
-                        progressStatus.textContent = 'Error: ' + errorMessage;
-                        progressStatus.style.color = '#c62828';
-                        stopProgressMonitoring();
-                        resetForm();
-                    } else if (allDone && totalUrls > 0) {
-                        progressStatus.textContent = `✓ All ${totalCompleted} file(s) downloaded successfully!`;
-                        progressStatus.style.color = '#2e7d32';
-                        progressDetails.textContent = 'Finalizing and creating your clip...';
-                        
-                        // Wait a moment then redirect automatically
-                        setTimeout(() => {
-                            stopProgressMonitoring();
-                            // The form was already submitted, so we just wait for redirect
-                        }, 1500);
-                    } else if (totalUrls > 0) {
-                        progressStatus.textContent = `Downloading: ${totalCompleted}/${totalUrls} files completed`;
-                        progressDetails.textContent = `Overall progress: ${avgProgress}%`;
-                    }
-                    
-                } catch (error) {
-                    console.error('Progress check failed:', error);
-                    progressStatus.textContent = 'Progress check failed, but download continues...';
-                }
-            }, 1000); // Check every second
-        }
-        
-        function stopProgressMonitoring() {
-            if (progressInterval) {
-                clearInterval(progressInterval);
-                progressInterval = null;
-            }
-        }
-        
-        function resetForm() {
-            setTimeout(() => {
-                submitBtn.disabled = false;
-                submitBtn.value = "🚀 Create Clip (Expires in {{ EXPIRY_DAYS }} days)";
-                progressContainer.style.display = 'none';
-            }, 3000);
-        }
-        
-        // Clean up on page unload
-        window.addEventListener('beforeunload', () => {
-            stopProgressMonitoring();
-        });
-    </script>
 </body>
 </html>
 INDEXEOF
 
-# --- clipboard.html (Updated for V44) ---
+# --- clipboard.html ---
 cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -1628,267 +1134,27 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clip: {{ key }}</title>
     <style>
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            color: #333; 
-            margin: 0; 
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container { 
-            max-width: 900px; 
-            margin: 0 auto; 
-            background-color: #fff; 
-            padding: 40px; 
-            border-radius: 16px; 
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
-            animation: fadeIn 0.6s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        h1 { 
-            color: #2c3e50; 
-            text-align: center; 
-            margin-bottom: 25px; 
-            font-size: 2em;
-            background: linear-gradient(90deg, #3498db, #2ecc71);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        pre { 
-            background: #f8f9fa; 
-            padding: 25px; 
-            border-radius: 12px; 
-            white-space: pre-wrap; 
-            word-wrap: break-word; 
-            overflow: auto; 
-            max-height: 500px; 
-            margin-bottom: 30px; 
-            border: 2px solid #e9ecef; 
-            font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 1.05em;
-            line-height: 1.6;
-        }
-        .content-section { 
-            margin-bottom: 40px; 
-            position: relative;
-        }
-        .content-section h2 {
-            color: #2c3e50;
-            margin-bottom: 15px;
-            font-size: 1.4em;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .files-section { 
-            margin-bottom: 40px; 
-            border-top: 2px solid #e9ecef; 
-            padding-top: 30px; 
-        }
-        .files-section h2 { 
-            color: #2c3e50; 
-            font-size: 1.4em; 
-            margin-bottom: 25px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .file-list {
-            display: grid;
-            gap: 15px;
-        }
-        .file-item { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            padding: 20px; 
-            border-radius: 12px; 
-            margin-bottom: 10px; 
-            border-left: 5px solid #3498db;
-            transition: all 0.3s ease;
-            border: 1px solid #dee2e6;
-        }
-        .file-item:hover {
-            transform: translateX(5px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
-            border-left-color: #2ecc71;
-        }
-        .file-info {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .file-name {
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 1.1em;
-            word-break: break-word;
-        }
-        .file-size {
-            font-size: 0.9em;
-            color: #6c757d;
-        }
-        .file-item a { 
-            background: linear-gradient(90deg, #3498db, #2ecc71);
-            color: white;
-            padding: 12px 25px;
-            border-radius: 8px;
-            text-decoration: none; 
-            font-weight: 600;
-            transition: all 0.3s ease;
-            white-space: nowrap;
-            margin-left: 15px;
-        }
-        .file-item a:hover { 
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.3);
-            text-decoration: none;
-        }
-        .expiry-info { 
-            text-align: center; 
-            color: #fff; 
-            font-weight: 600; 
-            margin-bottom: 30px;
-            padding: 20px;
-            border-radius: 12px;
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.2);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 15px;
-            flex-wrap: wrap;
-        }
-        .expiry-item {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            min-width: 80px;
-        }
-        .expiry-value {
-            font-size: 1.8em;
-            font-weight: 700;
-        }
-        .expiry-label {
-            font-size: 0.9em;
-            opacity: 0.9;
-        }
-        .back-link { 
-            display: block; 
-            text-align: center; 
-            margin-top: 40px; 
-        }
-        .back-link a { 
-            background: linear-gradient(90deg, #6c757d, #495057);
-            color: white; 
-            padding: 15px 30px;
-            border-radius: 10px;
-            text-decoration: none; 
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .back-link a:hover { 
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(108, 117, 125, 0.3);
-            text-decoration: none;
-        }
-        .flash { 
-            padding: 20px; 
-            border-radius: 12px; 
-            margin-bottom: 25px; 
-            font-weight: 600;
-            border-left: 5px solid;
-            animation: slideIn 0.5s ease;
-        }
-        .error { 
-            background-color: #ffebee; 
-            color: #c62828; 
-            border-left-color: #c62828;
-        }
-        .success { 
-            background-color: #e8f5e9; 
-            color: #2e7d32; 
-            border-left-color: #2e7d32;
-        }
-        .copy-button { 
-            background: linear-gradient(90deg, #ff9800, #ff5722);
-            color: white; 
-            padding: 12px 25px; 
-            border: none; 
-            border-radius: 8px; 
-            cursor: pointer; 
-            font-size: 1em; 
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-        .copy-button:hover { 
-            background: linear-gradient(90deg, #ff5722, #ff9800);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(255, 87, 34, 0.3);
-        }
-        .clip-info {
-            text-align: center;
-            margin-bottom: 25px;
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 10px;
-            border: 1px solid #e9ecef;
-        }
-        .clip-key {
-            font-family: monospace;
-            background: #2c3e50;
-            color: white;
-            padding: 8px 15px;
-            border-radius: 6px;
-            font-size: 1.2em;
-            display: inline-block;
-            margin: 10px 0;
-        }
-        .empty-state {
-            text-align: center;
-            padding: 40px;
-            color: #6c757d;
-        }
-        .empty-state i {
-            font-size: 3em;
-            margin-bottom: 20px;
-            opacity: 0.5;
-        }
-        .empty-state h2 {
-            color: #6c757d;
-            margin-bottom: 10px;
-        }
-        .version-badge {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            background: #2ecc71;
-            color: white;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 0.8em;
-            font-weight: 600;
-        }
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #007bff; text-align: center; margin-bottom: 20px; }
+        pre { background-color: #eee; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; overflow: auto; max-height: 400px; margin-bottom: 20px; border: 1px solid #ccc; position: relative; }
+        .content-section { margin-bottom: 30px; }
+        .files-section { margin-bottom: 30px; border-top: 1px solid #eee; padding-top: 20px; }
+        .files-section h2 { color: #333; font-size: 1.2em; margin-bottom: 15px; }
+        .file-item { display: flex; justify-content: space-between; align-items: center; background-color: #f0f8ff; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px; border-right: 5px solid #007bff; }
+        .file-item a { color: #007bff; text-decoration: none; font-weight: bold; }
+        .file-item a:hover { text-decoration: underline; }
+        .expiry-info { text-align: center; color: #d9534f; font-weight: bold; margin-bottom: 20px; }
+        .back-link { display: block; text-align: center; margin-top: 30px; }
+        .back-link a { color: #007bff; text-decoration: none; font-weight: bold; }
+        .flash { padding: 15px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .copy-button { background-color: #5cb85c; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; float: left; margin-right: 10px; }
+        .copy-button:hover { background-color: #4cae4c; }
     </style>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
     <div class="container">
-        <div class="version-badge">V44</div>
-        
         <div class="flash error">
             {% for category, message in get_flashed_messages(with_categories=true) %}
                 {% if category == 'error' %}
@@ -1898,88 +1164,47 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
         </div>
         
         {% if clip and (content or files_info) %}
-            <h1><i class="fas fa-clipboard"></i> Clipboard Content</h1>
-            
-            <div class="clip-info">
-                <div>Access Key:</div>
-                <div class="clip-key">{{ key }}</div>
-                <div style="margin-top: 10px; font-size: 0.9em; color: #6c757d;">
-                    Share this link: <strong>http://{{ request.host }}/{{ key }}</strong>
-                </div>
-            </div>
+            <h1>Clip Content for: {{ key }}</h1>
             
             <div class="expiry-info">
-                <div class="expiry-item">
-                    <div class="expiry-value">{{ expiry_info_days }}</div>
-                    <div class="expiry-label">Days</div>
-                </div>
-                <div class="expiry-item">
-                    <div class="expiry-value">{{ expiry_info_hours }}</div>
-                    <div class="expiry-label">Hours</div>
-                </div>
-                <div class="expiry-item">
-                    <div class="expiry-value">{{ expiry_info_minutes }}</div>
-                    <div class="expiry-label">Minutes</div>
-                </div>
-                <div style="flex-basis: 100%; text-align: center; margin-top: 10px;">
-                    <i class="fas fa-clock"></i> Time remaining until expiration
-                </div>
+                Expires in: {{ expiry_info_days }} days, {{ expiry_info_hours }} hours, and {{ expiry_info_minutes }} minutes.
             </div>
 
             <div class="content-section">
-                <h2><i class="fas fa-file-alt"></i> Text Content</h2>
+                <h2>Text Content</h2>
                 {% if content %}
-                    <button class="copy-button" onclick="copyContent()">
-                        <i class="fas fa-copy"></i> Copy Text
-                    </button>
+                    <button class="copy-button" onclick="copyContent()">Copy Text</button>
                     <pre id="text-content">{{ content }}</pre>
                 {% else %}
-                    <div class="empty-state">
-                        <i class="fas fa-file-alt"></i>
-                        <h2>No Text Content</h2>
-                        <p>This clip contains only attached files.</p>
-                    </div>
+                    <p> (This clip contains no text content and only has attached files) </p>
                 {% endif %}
             </div>
         
         {% else %}
-             <h1><i class="fas fa-exclamation-triangle"></i> Clip Not Found</h1>
-             <div class="expiry-info" style="background: linear-gradient(135deg, #dc3545, #c82333);">
+             <h1>Clip Not Found</h1>
+             <div class="expiry-info">
                  {% if expired %}
-                     <i class="fas fa-hourglass-end"></i> This clipboard link has expired and its content has been deleted.
+                     This clipboard link has expired and its content has been deleted.
                  {% else %}
-                     <i class="fas fa-search"></i> Clip with key <strong>{{ key }}</strong> does not exist.
+                     Clip with key **{{ key }}** does not exist.
                  {% endif %}
              </div>
         {% endif %}
         
         {% if files_info %}
             <div class="files-section">
-                <h2><i class="fas fa-paperclip"></i> Attached Files ({{ files_info|length }})</h2>
-                <div class="file-list">
-                    {% for file in files_info %}
-                        <div class="file-item">
-                            <div class="file-info">
-                                <div class="file-name">
-                                    <i class="fas fa-file"></i> {{ file.name }}
-                                </div>
-                                <div class="file-size">
-                                    <i class="fas fa-hdd"></i> File ready for download
-                                </div>
-                            </div>
-                            <a href="{{ url_for('download_file', filename=file.path) }}">
-                                <i class="fas fa-download"></i> Download
-                            </a>
-                        </div>
-                    {% endfor %}
-                </div>
+                <h2>Attached Files ({{ files_info|length }})</h2>
+                {% for file in files_info %}
+                    <div class="file-item">
+                        <span>{{ file.name }}</span>
+                        <a href="{{ url_for('download_file', filename=file.path) }}">Download</a>
+                    </div>
+                {% endfor %}
             </div>
         {% endif %}
 
         <div class="back-link">
-            <a href="/">
-                <i class="fas fa-arrow-left"></i> Create New Clip
-            </a>
+            <a href="/">← Create New Clip</a>
         </div>
     </div>
 
@@ -1991,17 +1216,9 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 return;
             }
             
-            const button = event.target.closest('.copy-button');
-            const originalHTML = button.innerHTML;
-            
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(contentElement.innerText).then(() => {
-                    button.innerHTML = '<i class="fas fa-check"></i> Copied!';
-                    button.style.background = 'linear-gradient(90deg, #2ecc71, #27ae60)';
-                    setTimeout(() => {
-                        button.innerHTML = originalHTML;
-                        button.style.background = 'linear-gradient(90deg, #ff9800, #ff5722)';
-                    }, 2000);
+                    alert('Text copied to clipboard!');
                 }).catch(err => {
                     copyFallback(contentElement);
                 });
@@ -2023,15 +1240,7 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
                 tempTextArea.setSelectionRange(0, 99999);
                 document.execCommand('copy');
                 document.body.removeChild(tempTextArea);
-                
-                const button = event.target.closest('.copy-button');
-                const originalHTML = button.innerHTML;
-                button.innerHTML = '<i class="fas fa-check"></i> Copied!';
-                button.style.background = 'linear-gradient(90deg, #2ecc71, #27ae60)';
-                setTimeout(() => {
-                    button.innerHTML = originalHTML;
-                    button.style.background = 'linear-gradient(90deg, #ff9800, #ff5722)';
-                }, 2000);
+                alert('Text copied to clipboard!');
             } catch (err) {
                 alert('Copy Error! Please manually select and copy the text.');
             }
@@ -2041,209 +1250,54 @@ cat > "$INSTALL_DIR/templates/clipboard.html" << 'CLIPBOARDEOF'
 </html>
 CLIPBOARDEOF
 
-# --- error.html (Updated for V44) ---
+# --- error.html ---
 cat > "$INSTALL_DIR/templates/error.html" << 'ERROREOF'
 <!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Error - Clipboard Server V44</title>
+    <title>Error</title>
     <style>
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            color: #333; 
-            margin: 0; 
-            padding: 50px; 
-            text-align: center;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        .container { 
-            max-width: 700px; 
-            background-color: #fff; 
-            padding: 50px; 
-            border-radius: 20px; 
-            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.15);
-            animation: fadeIn 0.8s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: scale(0.95); }
-            to { opacity: 1; transform: scale(1); }
-        }
-        h1 { 
-            color: #dc3545; 
-            margin-bottom: 25px; 
-            font-size: 2.5em;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 15px;
-        }
-        p { 
-            font-size: 1.2em; 
-            color: #555; 
-            line-height: 1.6;
-            margin-bottom: 25px;
-        }
-        .error-message { 
-            margin: 30px 0; 
-            padding: 25px; 
-            background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%);
-            border: 2px solid #ef5350; 
-            border-radius: 15px; 
-            color: #c62828; 
-            font-weight: 600;
-            font-size: 1.1em;
-            text-align: left;
-            border-left: 6px solid #c62828;
-        }
-        .code-block {
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 20px;
-            border-radius: 10px;
-            font-family: 'Consolas', 'Monaco', monospace;
-            text-align: left;
-            margin: 25px 0;
-            font-size: 1.1em;
-            overflow-x: auto;
-        }
-        .action-buttons {
-            display: flex;
-            gap: 20px;
-            justify-content: center;
-            margin-top: 35px;
-            flex-wrap: wrap;
-        }
-        .action-button {
-            padding: 15px 30px;
-            border-radius: 10px;
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .back-button {
-            background: linear-gradient(90deg, #3498db, #2980b9);
-            color: white;
-        }
-        .log-button {
-            background: linear-gradient(90deg, #6c757d, #495057);
-            color: white;
-        }
-        .action-button:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 7px 14px rgba(0, 0, 0, 0.15);
-            text-decoration: none;
-        }
-        .version-info {
-            margin-top: 30px;
-            color: #7f8c8d;
-            font-size: 0.9em;
-        }
-        .support-info {
-            margin-top: 25px;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 12px;
-            border: 1px solid #e9ecef;
-            text-align: left;
-        }
-        .support-info h3 {
-            color: #2c3e50;
-            margin-bottom: 15px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
+        body { font-family: Tahoma, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 50px; text-align: center;}
+        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #dc3545; margin-bottom: 20px; }
+        p { font-size: 1.1em; color: #555; }
+        .error-message { margin-top: 30px; padding: 15px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; color: #721c24; font-weight: bold; }
     </style>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
     <div class="container">
-        <h1><i class="fas fa-exclamation-circle"></i> Internal Error</h1>
-        
+        <h1>❌ Internal Error</h1>
         <div class="error-message">
-            <p><strong>Error Details:</strong></p>
             <p>{{ message }}</p>
         </div>
-        
-        <p>This is likely a server configuration issue or a temporary problem.</p>
-        
-        <div class="support-info">
-            <h3><i class="fas fa-life-ring"></i> Troubleshooting Steps:</h3>
-            <ol>
-                <li><strong>Check server logs:</strong> Run the command below to see detailed error information.</li>
-                <li><strong>Verify database:</strong> Ensure the CLI tool has been initialized at least once.</li>
-                <li><strong>Check service status:</strong> Make sure the clipboard service is running.</li>
-                <li><strong>Restart service:</strong> Sometimes a simple restart fixes the issue.</li>
-            </ol>
-        </div>
-        
-        <div class="code-block">
-            # Check service status<br>
-            sudo systemctl status clipboard.service<br><br>
-            
-            # View server logs<br>
-            sudo journalctl -u clipboard.service -f<br><br>
-            
-            # Restart service<br>
-            sudo systemctl restart clipboard.service<br><br>
-            
-            # Run CLI to check database<br>
-            sudo /opt/clipboard_server/clipboard_cli.sh
-        </div>
-        
-        <div class="action-buttons">
-            <a href="/" class="action-button back-button">
-                <i class="fas fa-home"></i> Back to Home
-            </a>
-            <a href="#" onclick="alert('Run: sudo journalctl -u clipboard.service -f')" class="action-button log-button">
-                <i class="fas fa-terminal"></i> View Logs Command
-            </a>
-        </div>
-        
-        <div class="version-info">
-            <i class="fas fa-code"></i> Clipboard Server V44 - Progress Bar Edition
-        </div>
+        <p>This is likely a server configuration issue.</p>
+        <p>Please check the server logs (<code>sudo journalctl -u clipboard.service</code>) and ensure the CLI tool has been run at least once.</p>
     </div>
 </body>
 </html>
 ERROREOF
 
 # ============================================
-# 6. Create Systemd Service (V44 - Enhanced)
+# 6. Create Systemd Service (V43 - STABILITY FIX)
 # ============================================
-print_status "6/7: Creating Systemd service (V44 - Enhanced)..."
+print_status "6/7: Creating Systemd service (V43 - STABILITY FIX with Threads & Workers)..."
+
 cat > /etc/systemd/system/clipboard.service << SERVICEEOF
 [Unit]
-Description=Flask Clipboard Web Server V44 (Progress Bar Edition)
+Description=Flask Clipboard Web Server (V43 - Stability Fix with Threads)
 After=network.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 User=root 
 WorkingDirectory=${INSTALL_DIR}
-# Enhanced configuration for V44 with progress tracking
+# FIXED: Increased workers to 4, added threads for better concurrency
 ExecStart=${GUNICORN_VENV_PATH} --workers 4 --threads 4 --worker-class gthread --timeout 0 --bind 0.0.0.0:${CLIPBOARD_PORT} web_service:app
 Environment=DOTENV_FULL_PATH=${INSTALL_DIR}/.env
 Restart=always
 RestartSec=3
-StartLimitInterval=60s
-StartLimitBurst=3
-
-# Security enhancements
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=${INSTALL_DIR}/uploads ${INSTALL_DIR}/clipboard.db
 
 [Install]
 WantedBy=multi-user.target
@@ -2284,7 +1338,7 @@ fi
 
 echo ""
 echo "================================================"
-echo "🎉 Installation Complete (Clipboard Server V44)"
+echo "🎉 Installation Complete (Clipboard Server V43)"
 echo "================================================"
 echo "✅ Web service is active on port ${CLIPBOARD_PORT}"
 echo "------------------------------------------------"
@@ -2295,25 +1349,21 @@ echo -e "   ${BLUE}sudo ${INSTALL_DIR}/clipboard_cli.sh${NC}"
 echo "------------------------------------------------"
 echo "📁 Upload Directory: ${INSTALL_DIR}/uploads"
 echo "🗄️  Database: ${INSTALL_DIR}/clipboard.db"
+echo "📋 Supported File Types:"
+echo "   APK, EXE, DEB, MSI, DMG, ZIP, RAR, 7Z, PDF,"
+echo "   PNG, JPG, MP3, MP4, TXT, ISO, BIN, and more..."
 echo "------------------------------------------------"
-echo "🚀 V44 ENHANCEMENTS:"
-echo "   • Live Progress Bar for URL downloads"
-echo "   • Real-time download status monitoring"
-echo "   • Threaded download manager"
-echo "   • Enhanced UI with animations"
-echo "   • Improved error handling"
+echo "🔧 V43 STABILITY FIXES:"
+echo "   • 4 Workers + 4 Threads each"
+echo "   • gthread worker class for I/O optimization"
+echo "   • Increased database timeout to 30s"
+echo "   • Larger download chunks (16KB)"
 echo "------------------------------------------------"
-echo "🔧 Service Management:"
-echo "   Status:  sudo systemctl status clipboard.service"
-echo "   Logs:    sudo journalctl -u clipboard.service -f"
-echo "   Restart: sudo systemctl restart clipboard.service"
-echo "   Stop:    sudo systemctl stop clipboard.service"
+echo "Logs:    sudo journalctl -u clipboard.service -f"
+echo "Status:  sudo systemctl status clipboard.service"
+echo "Restart: sudo systemctl restart clipboard.service"
 echo "================================================"
 echo ""
-echo "✅ V44 is ready with Live Progress Tracking!"
-echo "   Users can now see real-time download progress."
-echo ""
-echo "⚠️  First-time setup complete."
-echo "   You can now access the web interface at:"
-echo -e "   ${GREEN}http://${SERVER_IP}:${CLIPBOARD_PORT}${NC}"
+echo "✅ Server is now MUCH more stable under heavy load!"
+echo "   No more 503 errors during large file downloads."
 echo ""
